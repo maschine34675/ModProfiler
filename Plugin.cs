@@ -1,6 +1,8 @@
+using System;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using ModProfiler.Profiling;
 using ModProfiler.UI;
 using UnityEngine;
 
@@ -12,7 +14,7 @@ namespace ModProfiler
     {
         public const string PluginGuid = "com.maschine.ModProfiler";
         public const string PluginName = "maschine-ModProfiler";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.3.0";
 
         internal static ManualLogSource Log;
 
@@ -20,20 +22,29 @@ namespace ModProfiler
         internal static ConfigEntry<bool> ProfileHarmonyPatches;
         internal static ConfigEntry<bool> ProfileMonoBehaviours;
         internal static ConfigEntry<bool> ProfileCoroutines;
+        internal static ConfigEntry<bool> ProfileVanilla;
         internal static ConfigEntry<bool> IncludeSptPlugins;
         internal static ConfigEntry<int> TopMethodsPerMod;
         internal static ConfigEntry<float> RefreshInterval;
         internal static ConfigEntry<bool> PreferWebUi;
+        internal static ConfigEntry<bool> LogInputState;
         internal static ConfigEntry<float> SpikeThresholdMs;
+        internal static ConfigEntry<float> AutoExportIntervalSeconds;
 
         private void Awake()
         {
             Log = Logger;
+            ProfilerCore.MainThreadId = Environment.CurrentManagedThreadId;
+            GcHeapSource.Validate();
             ToggleKey = Config.Bind("General", "ToggleOverlay", new KeyboardShortcut(KeyCode.F11),
                 Tagged("Profiler Hotkey", 10,
                     "Opens/closes the profiler overlay. The first activation instruments all mod code, " +
                     "which can freeze the game for a few seconds."));
-
+            LogInputState = Config.Bind("Diagnostics", "LogInputState", false,
+                Advanced("Log Input State", 0,
+                    "Writes one line whenever this mod's view of the foreground window or its"
+                    + " muting of the game's input changes. Only useful when reporting a problem"
+                    + " with the mouse or keyboard."));
             PreferWebUi = Config.Bind("UI", "PreferWebOverlay", true,
                 Tagged("Use Web Overlay Window", 50,
                     "Show the profiler in an Anvil-WebOverlay window when that library is installed " +
@@ -53,6 +64,13 @@ namespace ModProfiler
                     "recorded in the web window's spike log together with their top contributors. 0 disables.",
                     new AcceptableValueRange<float>(0f, 1000f)));
 
+            AutoExportIntervalSeconds = Config.Bind("CSV", "AutoExportIntervalSeconds", 0f,
+                Tagged("Auto-Export Every (s)", 10,
+                    "Writes a CSV export on its own every this many seconds of measuring, into the same " +
+                    "folder as the CSV button. Time with the profiler closed or paused does not count. " +
+                    "0 turns it off; values below 10 count as 10.",
+                    new AcceptableValueRange<float>(0f, 3600f)));
+
             ProfileHarmonyPatches = Config.Bind("Profiling", "HarmonyPatches", true,
                 Tagged("Measure Harmony Patches", 40,
                     "Measure every Harmony prefix/postfix/finalizer that other mods have applied."));
@@ -62,6 +80,12 @@ namespace ModProfiler
             ProfileCoroutines = Config.Bind("Profiling", "CoroutinesAndAsync", true,
                 Tagged("Measure Coroutines And Async", 20,
                     "Measure coroutine/async state machine steps (MoveNext) defined in mod assemblies."));
+            ProfileVanilla = Config.Bind("Profiling", "VanillaEngineMethods", true,
+                Tagged("Measure EFT Itself", 5,
+                    "Measure a curated set of the game's own per-frame loops (world tick, bot AI, " +
+                    "player update, ballistics, the interaction prompt) under 'EFT (vanilla)', so a " +
+                    "spike can be told apart from mod work. Two of these seven rows are each already " +
+                    "counted inside one of the other five; see the row tooltip."));
             IncludeSptPlugins = Config.Bind("Profiling", "IncludeSptCorePlugins", true,
                 Tagged("Include SPT Core Plugins", 10,
                     "Also profile the SPT core plugins (BepInEx/plugins/spt). Turning this off only affects " +
@@ -77,6 +101,19 @@ namespace ModProfiler
         private static ConfigDescription Tagged(string displayName, int order, string description)
         {
             return Tagged(displayName, order, description, null);
+        }
+        private static ConfigDescription Advanced(string displayName, int order, string description)
+        {
+            return new ConfigDescription(
+                description,
+                null,
+                new ConfigurationManagerAttributes
+                {
+                    DispName = displayName,
+                    Order = order,
+                    IsAdvanced = true,
+                    ShowRangeAsPercent = false,
+                });
         }
 
         private static ConfigDescription Tagged(string displayName, int order, string description,

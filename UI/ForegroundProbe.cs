@@ -10,6 +10,16 @@ namespace ModProfiler.UI
         private static bool resolved;
         private static IntPtr gameWindow;
         private static uint processId;
+        internal static IntPtr GameWindowHandle
+        {
+            get
+            {
+                if (!resolved)
+                    Resolve();
+                return gameWindow;
+            }
+        }
+        internal static IntPtr ForegroundHandle => GetForegroundWindow();
 
         internal static bool OverlayInFront()
         {

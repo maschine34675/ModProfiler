@@ -45,12 +45,18 @@ namespace ModProfiler.UI
             if (live != shown)
             {
                 shown = live;
-                ProfilerCore.Active = live;
+                ProfilerCore.SetActive(live);
                 if (live)
                     nextSnapshot = 0f;
             }
+            if (CsvExport.LastExportMessage != lastExportShown)
+            {
+                lastExportShown = CsvExport.LastExportMessage;
+                nextSnapshot = 0f;
+            }
 
             ManageRaidInput();
+            ReportInputState();
 
             if (Hotkey.IsPressed(Plugin.ToggleKey.Value))
                 TogglePanel();
@@ -75,6 +81,24 @@ namespace ModProfiler.UI
             else
                 ReleaseGameInput();
         }
+        private void ReportInputState()
+        {
+            if (!Plugin.LogInputState.Value)
+                return;
+            string state = "shown=" + shown
+                + " overlayInFront=" + ForegroundProbe.OverlayInFront()
+                + " blocking=" + blockingGameInput
+                + " blocked=" + GameInputBlocker.Blocked
+                + " gameWindow=" + ForegroundProbe.GameWindowHandle.ToString("X")
+                + " foreground=" + ForegroundProbe.ForegroundHandle.ToString("X");
+            if (state == lastInputState)
+                return;
+            lastInputState = state;
+            Plugin.Log.LogInfo("input: " + state);
+        }
+
+        private string lastInputState;
+        private string lastExportShown;
         private void ReleaseGameInput()
         {
             if (!blockingGameInput)
@@ -115,7 +139,7 @@ namespace ModProfiler.UI
             }
 
             shown = !shown;
-            ProfilerCore.Active = shown;
+            ProfilerCore.SetActive(shown);
             if (shown)
                 nextSnapshot = 0f;
         }
@@ -123,7 +147,7 @@ namespace ModProfiler.UI
         {
             OwnsHotkey = false;
             shown = false;
-            ProfilerCore.Active = false;
+            ProfilerCore.SetActive(false);
             ReleaseGameInput();
             enabled = false;
         }
@@ -156,11 +180,11 @@ namespace ModProfiler.UI
             switch (payload)
             {
                 case "pause":
-                    ProfilerCore.Active = false;
+                    ProfilerCore.SetActive(false);
                     nextSnapshot = 0f;
                     break;
                 case "resume":
-                    ProfilerCore.Active = shown;
+                    ProfilerCore.SetActive(shown);
                     nextSnapshot = 0f;
                     break;
                 case "reset":
@@ -186,9 +210,7 @@ namespace ModProfiler.UI
                 case "csv":
                     try
                     {
-                        string outcome = "CSV written: " + CsvExport.Write();
-                        Plugin.Log.LogInfo(outcome);
-                        return outcome;
+                        return CsvExport.Begin("manual");
                     }
                     catch (Exception e)
                     {
@@ -248,6 +270,9 @@ namespace ModProfiler.UI
             methodScratch.AddRange(mod.Methods);
             methodScratch.Sort((a, b) => b.WindowAvgMs(frames).CompareTo(a.WindowAvgMs(frames)));
             int n = Math.Min(Plugin.TopMethodsPerMod.Value, methodScratch.Count);
+            for (int i = n; i < methodScratch.Count; i++)
+                if (methodScratch[i].Growth != null && methodScratch[i].Growth.Growing)
+                    methodScratch[n++] = methodScratch[i];
 
             reply.Length = 0;
             reply.Append('[');
@@ -259,19 +284,39 @@ namespace ModProfiler.UI
                 reply.Append("{\"n\":");
                 AppendJsonString(reply, m.DisplayName);
                 reply.Append(",\"c\":\"").Append(m.Category.Length > 0 ? m.Category[0] : '?').Append('"');
+                if (m.NestedUnder != null)
+                {
+                    reply.Append(",\"nu\":");
+                    AppendJsonString(reply, m.NestedUnder);
+                }
                 AppendNumbers(reply, m.WindowAvgMs(frames), m.WindowMaxMs(frames),
                     m.WindowCallsPerFrame(frames), m.TotalTicks * ProfilerCore.MsPerTick);
+                if (m.Growth != null && m.Growth.Growing)
+                {
+                    reply.Append(",\"g\":");
+                    AppendGrowth(reply, m.Growth);
+                }
                 reply.Append('}');
             }
             reply.Append(']');
             return reply.ToString();
         }
+        private static void AppendGrowth(StringBuilder sb, GrowthTracker growth)
+        {
+            sb.Append('[');
+            AppendGrowthValues(sb, growth);
+            sb.Append(']');
+        }
+        private static void AppendGrowthValues(StringBuilder sb, GrowthTracker growth)
+        {
+            double minutes = Math.Max(0.0, (ProfilerCore.MeasuredSeconds - growth.SinceSeconds) / 60.0);
+            sb.Append(growth.From.ToString("F1", CultureInfo.InvariantCulture))
+              .Append(',').Append(growth.To.ToString("F1", CultureInfo.InvariantCulture))
+              .Append(',').Append(minutes.ToString("F1", CultureInfo.InvariantCulture));
+        }
         private string BuildSnapshot()
         {
             int frames = Math.Max(1, ProfilerCore.FramesObserved);
-            int gcCount = 0;
-            for (int g = 0; g <= GC.MaxGeneration; g++)
-                gcCount += GC.CollectionCount(g);
 
             json.Length = 0;
             json.Append("{\"frameMs\":").Append(ProfilerCore.AverageFrameMs().ToString("F2", CultureInfo.InvariantCulture))
@@ -279,24 +324,45 @@ namespace ModProfiler.UI
                 .Append(",\"methods\":").Append(ProfilerCore.StatsByMethod.Count)
                 .Append(",\"frames\":").Append(frames)
                 .Append(",\"failures\":").Append(ProfilerCore.PatchFailures)
-                .Append(",\"gc\":").Append(gcCount)
-                .Append(",\"spikes\":[");
+                .Append(",\"gc\":").Append(ProfilerCore.GcCount())
+                .Append(",\"gcOn\":").Append(ProfilerCore.GcModeEnabled ? "true" : "false")
+                .Append(",\"gcRate\":").Append(ProfilerCore.GcPerSecond.ToString("F2", CultureInfo.InvariantCulture))
+                .Append(",\"heapMb\":").Append(ProfilerCore.HeapMb.ToString("F1", CultureInfo.InvariantCulture))
+                .Append(",\"heapPeakMb\":").Append(ProfilerCore.HeapPeakMb.ToString("F1", CultureInfo.InvariantCulture))
+                .Append(",\"allocMbS\":").Append(GcHeapSource.Available
+                    ? ProfilerCore.AllocMbS.ToString("F2", CultureInfo.InvariantCulture)
+                    : "null")
+                .Append(",\"allocSource\":\"").Append(GcHeapSource.SourceName).Append('"')
+                .Append(",\"measuredFrames\":").Append(ProfilerCore.TotalFrames)
+                .Append(",\"measuredSeconds\":").Append(ProfilerCore.MeasuredSeconds.ToString("F1", CultureInfo.InvariantCulture))
+                .Append(",\"lastExport\":");
+            AppendJsonString(json, CsvExport.LastExportMessage);
+            json.Append(",\"lastExportAt\":");
+            AppendJsonString(json, CsvExport.LastExportAt?.ToString("HH:mm:ss", CultureInfo.InvariantCulture));
+            if (!double.IsNaN(Calibration.FloorUs))
+                json.Append(",\"floorUs\":").Append(Calibration.FloorUs.ToString("F3", CultureInfo.InvariantCulture));
+            json.Append(",\"spikes\":[");
 
-            for (int i = 0; i < ProfilerCore.Spikes.Count; i++)
+            int firstSpike = Math.Max(0, ProfilerCore.Spikes.Count - ProfilerCore.SpikesInSnapshot);
+            for (int i = firstSpike; i < ProfilerCore.Spikes.Count; i++)
             {
                 ProfilerCore.SpikeEntry spike = ProfilerCore.Spikes[i];
-                if (i > 0)
+                if (i > firstSpike)
                     json.Append(',');
                 json.Append("{\"t\":\"").Append(spike.Time).Append("\",\"ms\":")
                     .Append(spike.FrameMs.ToString("F1", CultureInfo.InvariantCulture))
+                    .Append(",\"gc\":").Append(spike.Gc ? "true" : "false")
                     .Append(",\"top\":[");
                 for (int k = 0; k < spike.Top.Count; k++)
                 {
+                    ProfilerCore.SpikeContributor top = spike.Top[k];
                     if (k > 0)
                         json.Append(',');
                     json.Append('[');
-                    AppendJsonString(json, spike.Top[k].Key);
-                    json.Append(',').Append(spike.Top[k].Value.ToString("F1", CultureInfo.InvariantCulture)).Append(']');
+                    AppendJsonString(json, top.Mod);
+                    json.Append(',').Append(top.Ms.ToString("F1", CultureInfo.InvariantCulture)).Append(',');
+                    AppendJsonString(json, top.Method);
+                    json.Append(',').Append(top.MethodMs.ToString("F1", CultureInfo.InvariantCulture)).Append(']');
                 }
                 json.Append("]}");
             }
@@ -316,6 +382,21 @@ namespace ModProfiler.UI
                 AppendJsonString(json, mod.Name);
                 AppendNumbers(json, mod.WindowAvgMs(frames), mod.WindowMaxMs(frames),
                     mod.WindowCallsPerFrame(frames), mod.TotalTicks * ProfilerCore.MsPerTick);
+                bool anyGrowth = false;
+                foreach (MethodStats m in mod.Methods)
+                {
+                    if (m.Growth == null || !m.Growth.Growing)
+                        continue;
+                    json.Append(anyGrowth ? "," : ",\"grow\":[");
+                    anyGrowth = true;
+                    json.Append('[');
+                    AppendJsonString(json, m.DisplayName);
+                    json.Append(',');
+                    AppendGrowthValues(json, m.Growth);
+                    json.Append(']');
+                }
+                if (anyGrowth)
+                    json.Append(']');
                 json.Append('}');
             }
 
@@ -333,17 +414,7 @@ namespace ModProfiler.UI
 
         private static void AppendJsonString(StringBuilder sb, string value)
         {
-            sb.Append('"');
-            foreach (char c in value)
-            {
-                if (c == '"' || c == '\\')
-                    sb.Append('\\').Append(c);
-                else if (c < ' ')
-                    sb.Append("\\u").Append(((int)c).ToString("x4"));
-                else
-                    sb.Append(c);
-            }
-            sb.Append('"');
+            JsonBuilder.AppendString(sb, value);
         }
     }
 }

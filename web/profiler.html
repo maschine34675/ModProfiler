@@ -28,9 +28,13 @@
   #filter { background:#101110; color:#d0cdbd; border:1px solid rgba(194,173,109,0.35);
             border-radius:4px; padding:5px 9px; font-size:12px; width:170px; }
   #filter:focus { outline:1px solid #c2ad6d; }
-  #stats { display:flex; align-items:center; gap:14px; margin-top:8px;
-           color:#918e7e; font-size:12px; }
-  #stats b { color:#d0cdbd; font-weight:650; font-variant-numeric:tabular-nums; }
+  /* Two fixed lines, never wrapping: a wrapping stats row would push the
+     table down. The measurement line grows with the measured totals, so the
+     GC and heap figures get a line of their own instead of being clipped. */
+  .stats { display:flex; align-items:center; gap:14px; margin-top:8px;
+           color:#918e7e; font-size:12px; white-space:nowrap; overflow:hidden; }
+  #memstats { margin-top:3px; }
+  .stats b { color:#d0cdbd; font-weight:650; font-variant-numeric:tabular-nums; }
   #framespark { width:180px; height:26px; }
   .grid { display:grid; grid-template-columns:minmax(200px,1fr) 78px 78px 78px 78px 66px 92px 100px;
           align-items:center; }
@@ -60,7 +64,9 @@
   .method .num { color:#918e7e; }
   .spark { width:90px; height:22px; justify-self:end; }
   #status { padding:5px 14px; color:#918e7e; font-size:12px; min-height:26px;
-            border-top:1px solid rgba(194,173,109,0.2); }
+            border-top:1px solid rgba(194,173,109,0.2); display:flex; gap:14px; }
+  #statustext { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #lastexport { color:#6f6c5f; white-space:nowrap; }
   #empty { padding:30px; text-align:center; color:#918e7e; }
   /* Fixed height: the log must never grow the header, or the table would
      shift under the cursor exactly when a spike lands mid-click. */
@@ -68,6 +74,9 @@
               font-size:11px; color:#d98a5f; font-variant-numeric:tabular-nums;
               border-top:1px solid rgba(217,138,95,0.25); padding-top:4px; }
   #spikelog .who { color:#918e7e; }
+  #spikelog div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #spikelog .gcmark { color:#72ba80; }
+  .grow { color:#d98a5f; font-weight:650; }
   #failures { cursor:pointer; }
   #failures:hover { text-decoration:underline; }
   .failhead { padding:8px 0 6px; color:#d98a5f; font-size:12px; }
@@ -84,41 +93,44 @@
     <button id='pause' title='Stop or resume measuring. The instrumentation itself stays until the game restarts.'>Pause</button>
     <button id='rescan' class='quiet' title='Instrument patches created since the last scan - press once in raid.'>Rescan</button>
     <button id='reset' class='quiet' title='Zero all counters, totals and trends.'>Reset</button>
-    <button id='csv' class='quiet' title='Write the accumulated totals to BepInEx/plugins/maschine-ModProfiler/.'>CSV</button>
+    <button id='csv' class='quiet' title='Write the accumulated totals as CSV plus a .meta.json sidecar (frames, seconds, machine, spikes, patch failures) to BepInEx/plugins/maschine-ModProfiler/exports/&lt;session&gt;/.'>CSV</button>
     <input id='filter' type='text' placeholder='filter mods...' spellcheck='false'>
     <span style='flex:1'></span>
     <canvas id='framespark' width='180' height='26' title='Frame time over the last two minutes.'></canvas>
     <button id='close' class='quiet' title='Close (or Esc / the toggle key)'>✕</button>
   </div>
-  <div id='stats'>
+  <div id='stats' class='stats'>
     <span title='Average frame time over the sliding window, and the FPS that corresponds to it.'>Frame Ø <b id='frameMs'>-</b> ms (<b id='fps'>-</b> FPS)</span>
     <span title='Sum of all mod averages. Inclusive, so it can legitimately exceed the frame time.'>profiled Σ <b id='profiled'>-</b> ms/frame</span>
     <span title='Instrumented methods across all mods. Rescan picks up patches created after the last scan.'><b id='methods'>-</b> methods</span>
-    <span title='Sliding window length in rendered frames; all averages and peaks refer to it.'>window <b id='frames'>-</b> frames</span>
-    <span title='Garbage collections per second. Amber ticks on the frame graph mark intervals with a collection - a max outlier there is often the GC, not a mod.'>GC <b id='gc'>-</b>/s</span>
+    <span title='Window: the sliding window in rendered frames that all averages and peaks refer to. Measured: every frame and second measured since the last Reset - the denominator of the totals and of the CSV export. Time with the window closed or paused does not count.'>window <b id='frames'>-</b> · measured <b id='measured'>-</b></span>
+  </div>
+  <div id='memstats' class='stats'>
+    <span id='gcstat' title='Whether Unity&#39;s garbage collector is enabled for this raid. EFT switches it off on machines with 25 GB or more RAM - the heap then only ever grows until the raid or the collector restarts, and every long-raid curve looks like a leak. Read live: a mod that flips it back on mid-raid (e.g. ArenaMode) shows up on the very next sample.'>GC <b id='gcmode'>-</b> <b id='gc'>-</b>/s</span>
+    <span title='Managed heap size right now (GC.GetTotalMemory), its peak since the last reset, and bytes allocated per second, averaged over the last 150 frames - from GC.GetAllocatedBytesForCurrentThread where the runtime supports it; EFT&#39;s Boehm collector reports 0 for that counter, so the rate then comes from per-frame heap-size deltas (&quot;heap delta&quot; suffix): exact while the collector is off, a lower bound while it is on. With the collector off, heap only grows - watch the allocation rate for anomalies, not the slope of the heap number. Roughly 7 MB/s is normal in an Arena deathmatch.'>Heap <b id='heapmb'>-</b> MB (peak <b id='heappeak'>-</b>) · <b id='allocrate'>-</b> MB/s</span>
     <span id='failures' style='color:#d98a5f' title='Methods Harmony could not wrap - usually a foreign patch already uses a __state of another type. The originals are untouched, but their cost is invisible here. Click to list them; click again to return.'></span>
   </div>
-  <div id='spikelog' title='Frames slower than the configured SpikeThresholdMs, with the top measured contributors of that exact frame. A spike with no contributor points at the engine or the GC.'></div>
+  <div id='spikelog' title='Frames slower than the configured SpikeThresholdMs, with the top measured contributors of that exact frame and each one&#39;s most expensive method. GC marks a frame in which the garbage collector ran. A spike with no contributor points at the engine, at code this profiler does not measure, or at the GC.'></div>
 </div>
 <div id='head' class='grid'>
   <span data-sort='name' title='One row per mod assembly. Click a row to expand its most expensive methods.'>Mod</span>
   <span data-sort='avg' class='num' title='Average CPU time booked to this mod per rendered frame, over the sliding window. Inclusive: nested measured calls are double counted.'>Ø ms</span>
   <span data-sort='max' class='num' title='Most expensive single frame in the window.'>Max ms</span>
   <span data-sort='calls' class='num' title='Measured calls per rendered frame.'>Calls/F</span>
-  <span data-sort='percall' class='num' title='Average cost of one measured call. Values around 1 µs are mostly measurement overhead - the method itself does almost nothing.'>µs/Call</span>
+  <span data-sort='percall' class='num' title='Average cost of one measured call. The profiler measures its own cost per call at every scan; values close to that floor are mostly measurement and are greyed out - the method itself does almost nothing.'>µs/Call</span>
   <span data-sort='pct' class='num' title='Share of the average frame time. Inclusive and cross-mod, so the column can sum past 100 %.'>% Frame</span>
   <span data-sort='total' class='num' title='Accumulated total since activation or the last reset.'>Σ ms</span>
   <span class='num' title='Ø ms over time, one point per refresh. A flat line is constant background load; spikes are event-driven work.'>Trend</span>
 </div>
 <div id='rows'><div id='empty'>waiting for the first snapshot...</div></div>
-<div id='status'></div>
+<div id='status'><span id='statustext'></span><span id='lastexport' title='When the last CSV export was written.'></span></div>
 <script>
 (function () {
   'use strict';
   const el = id => document.getElementById(id);
   const bridge = window.overlay;
   if (!bridge) {
-    el('status').textContent = 'This page needs the Anvil-WebOverlay 1.6+ channel bridge.';
+    el('statustext').textContent = 'This page needs the Anvil-WebOverlay 1.6+ channel bridge.';
     return;
   }
 
@@ -129,12 +141,12 @@
   const history = new Map();
   const frameHistory = [];
   const gcMarks = [];
-  let lastGc = null, lastSnapAt = 0;
-  let gcAccumDelta = 0, gcAccumSeconds = 0, gcRateText = '-';
+  let lastGc = null;
   let sortKey = 'avg', sortDesc = true;
   let statusTimer = 0;
   let view = 'mods';
   let failures = [];
+  let lastExportShown = null;
   el('pause').onclick = () => bridge.send('cmd', snap && snap.active ? 'pause' : 'resume');
   el('rescan').onclick = () => {
     const button = el('rescan');
@@ -162,9 +174,9 @@
   };
 
   function setStatus(text) {
-    el('status').textContent = text == null ? 'no answer from the game' : text;
+    el('statustext').textContent = text == null ? 'no answer from the game' : text;
     clearTimeout(statusTimer);
-    statusTimer = setTimeout(() => { el('status').textContent = ''; }, 10000);
+    statusTimer = setTimeout(() => { el('statustext').textContent = ''; }, 10000);
   }
 
   document.querySelectorAll('#head span[data-sort]').forEach(h => {
@@ -201,10 +213,8 @@
   }
 
   function digest() {
-    const now = performance.now();
     const gcDelta = lastGc == null ? 0 : Math.max(0, snap.gc - lastGc);
-    const seconds = lastSnapAt > 0 ? (now - lastSnapAt) / 1000 : 0;
-    lastGc = snap.gc; lastSnapAt = now;
+    lastGc = snap.gc;
     if (snap.active && snap.frameMs > 0) {
       frameHistory.push(snap.frameMs);
       gcMarks.push(gcDelta > 0);
@@ -221,14 +231,19 @@
     el('profiled').textContent = snap.mods.reduce((s, m) => s + m.avg, 0).toFixed(2);
     el('methods').textContent = snap.methods;
     el('frames').textContent = snap.frames;
-    gcAccumDelta += gcDelta;
-    gcAccumSeconds += seconds;
-    if (gcAccumSeconds >= 0.25) {
-      gcRateText = (gcAccumDelta / gcAccumSeconds).toFixed(1);
-      gcAccumDelta = 0;
-      gcAccumSeconds = 0;
+    el('measured').textContent = formatMeasured(snap.measuredFrames, snap.measuredSeconds);
+    el('lastexport').textContent = snap.lastExportAt ? 'exported ' + snap.lastExportAt : '';
+    el('gcmode').textContent = snap.gcOn ? 'ON' : 'OFF';
+    el('gcmode').classList.toggle('hot', !snap.gcOn);
+    el('gc').textContent = snap.gcOn ? snap.gcRate.toFixed(1) : '-';
+    el('heapmb').textContent = snap.heapMb.toFixed(0);
+    el('heappeak').textContent = snap.heapPeakMb.toFixed(0);
+    el('allocrate').textContent = snap.allocMbS == null ? 'n/a'
+      : snap.allocMbS.toFixed(1) + (snap.allocSource === 'heap-delta' ? ' (heap delta)' : '');
+    if (snap.lastExport && snap.lastExport !== lastExportShown) {
+      lastExportShown = snap.lastExport;
+      setStatus(snap.lastExport);
     }
-    el('gc').textContent = gcRateText;
     el('failures').textContent = snap.failures > 0 ? snap.failures + ' patch failures' : '';
     el('pause').textContent = snap.active ? 'Pause' : 'Resume';
     drawSpark(el('framespark'), frameHistory, '#72ba80', gcMarks);
@@ -250,15 +265,51 @@
       const s = list[i];
       const line = document.createElement('div');
       line.textContent = s.t + '  ' + s.ms.toFixed(0) + ' ms ';
+      if (s.gc) {
+        const mark = document.createElement('span');
+        mark.className = 'gcmark';
+        mark.textContent = 'GC ';
+        line.appendChild(mark);
+      }
       const who = document.createElement('span');
       who.className = 'who';
       who.textContent = s.top.length
-        ? '— ' + s.top.map(t => t[0] + ' ' + t[1].toFixed(1)).join(', ')
-        : '— no measured mod stood out (engine or GC)';
+        ? '— ' + s.top.map(t => t[0] + ' ' + t[1].toFixed(1) + (t[2] ? ' (' + shortName(t[2]) + ')' : '')).join(', ')
+        : s.gc ? '— no measured mod stood out; the garbage collector ran'
+               : '— no measured mod stood out (engine or unmeasured code)';
       line.appendChild(who);
+      line.title = line.textContent;
       log.appendChild(line);
     }
   }
+  function shortName(name) {
+    const cut = name.indexOf(' (');
+    return cut > 0 ? name.substring(0, cut) : name;
+  }
+
+  function formatMeasured(frames, seconds) {
+    if (frames == null || seconds == null) return '-';
+    const total = Math.floor(seconds);
+    const minutes = Math.floor(total / 60);
+    const rest = String(total % 60).padStart(2, '0');
+    return frames.toLocaleString('en-US') + ' frames, ' + minutes + ':' + rest;
+  }
+  function growthText(name, g) {
+    return name + ': ' + g[0].toFixed(1) + ' → ' + g[1].toFixed(1) + ' per frame over '
+      + g[2].toFixed(0) + ' measured min';
+  }
+
+  const GROWTH_HINT = 'For Update/LateUpdate that is the number of live instances (FixedUpdate: per physics step). '
+    + 'A count whose lowest values keep rising is a leak candidate - for example a component left running on every '
+    + 'dead player. A population that follows bots or players can climb for a while too; the mark goes away once '
+    + 'the count falls back.';
+
+  const VANILLA_HINT = 'EFT (vanilla): a curated set of the game\'s own per-frame methods, not a mod. Includes '
+    + 'any mod Harmony patch attached directly to one of these methods - the timer wraps outside every other '
+    + 'patch on the same method, so this is not isolated engine code. Two of the seven rows (Player.ComplexUpdate, '
+    + 'BallisticsCalculator.ManualUpdate) are fully covered by the other five, already-counted rows '
+    + '(GameWorld.DoWorldTick or GameWorld.DoOtherWorldTick for ComplexUpdate; GameWorld.DoWorldTick for '
+    + 'ManualUpdate) - hover a nested row for which one; they do not add to this mod\'s total.';
   function render() {
     if (!snap) return;
     updateArrows();
@@ -294,7 +345,26 @@
     for (const mod of rows) {
       const row = document.createElement('div');
       row.className = 'grid mod' + (expanded.has(mod.n) ? ' open' : '');
-      cell(row, 'name', mod.n);
+      if (mod.grow && mod.grow.length) {
+        const name = document.createElement('div');
+        name.className = 'name';
+        const mark = document.createElement('span');
+        mark.className = 'grow';
+        mark.textContent = '▲ ';
+        name.appendChild(mark);
+        name.appendChild(document.createTextNode(mod.n));
+        name.title = mod.n + '\n\nGrowing instance count:\n'
+          + mod.grow.map(g => growthText(g[0], g.slice(1))).join('\n') + '\n\n' + GROWTH_HINT;
+        row.appendChild(name);
+      } else if (mod.n.startsWith('EFT (vanilla)')) {
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = mod.n;
+        name.title = VANILLA_HINT;
+        row.appendChild(name);
+      } else {
+        cell(row, 'name', mod.n);
+      }
       cell(row, 'num' + (mod.avg >= 1 ? ' hot' : ''), mod.avg.toFixed(2));
       cell(row, 'num', mod.max.toFixed(2));
       cell(row, 'num', mod.calls.toFixed(1));
@@ -324,12 +394,24 @@
           const cat = document.createElement('span');
           cat.className = 'cat';
           cat.textContent = '[' + method.c + '] ';
-          cat.title = method.c === 'H' ? 'Harmony patch applied by this mod'
+          cat.title = method.c === 'E' ? 'EFT (vanilla): base-game method timed with the same stopwatch - '
+              + 'includes any mod Harmony patch attached directly to it'
+            : method.c === 'H' ? 'Harmony patch applied by this mod'
             : method.c === 'U' ? 'Unity frame method (Update/FixedUpdate/LateUpdate/OnGUI)'
             : 'Coroutine / async state machine step';
           name.appendChild(cat);
-          name.appendChild(document.createTextNode(method.n));
-          name.title = method.n;
+          if (method.g) {
+            const mark = document.createElement('span');
+            mark.className = 'grow';
+            mark.textContent = '▲ ';
+            name.appendChild(mark);
+          }
+          const label = method.nu ? '↳ ' + method.n : method.n;
+          name.appendChild(document.createTextNode(label));
+          name.title = method.nu
+            ? label + '\n\ncounted inside ' + method.nu + '\'s row above - do not add this '
+              + 'number to a total, it is already part of ' + method.nu + '\'s elapsed time.'
+            : method.g ? method.n + '\n\n' + growthText('Growing', method.g) + '\n\n' + GROWTH_HINT : method.n;
           line.appendChild(name);
           cell(line, 'num', method.avg.toFixed(3));
           cell(line, 'num', method.max.toFixed(3));
@@ -384,10 +466,16 @@
     return entry.calls > 0 ? entry.avg / entry.calls * 1000 : 0;
   }
   function perCallCell(row, entry) {
-    const noisy = entry.percall > 0 && entry.percall < 2 && entry.calls >= 50;
+    const floor = snap && snap.floorUs > 0 ? snap.floorUs : null;
+    const limit = floor ? 2 * floor : 2;
+    const noisy = entry.percall > 0 && entry.percall < limit && entry.calls >= 50;
+    const why = floor
+      ? 'Within twice the measurement floor (' + floor.toFixed(2) + ' µs per call, measured at the last scan): '
+        + 'most of this value is the profiler itself, and even the ranking of this row is unreliable.'
+      : 'Close to the measurement overhead per call: this row is mostly profiler cost, and even its ranking is unreliable.';
     cell(row, 'num' + (noisy ? ' noise' : ''),
-      entry.calls > 0 ? entry.percall.toFixed(1) : '',
-      noisy ? 'Close to the ~1 µs measurement overhead per call: this row is mostly profiler cost, and even its ranking is unreliable.' : null);
+      entry.calls > 0 ? entry.percall.toFixed(entry.percall < 1 ? 2 : 1) : '',
+      noisy ? why : null);
   }
 
   function updateArrows() {

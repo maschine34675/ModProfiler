@@ -29,13 +29,34 @@ namespace ModProfiler.Profiling
             for (int i = 0; i < Methods.Count; i++)
             {
                 Methods[i].FlushFrame(slot, out long t, out long c);
-                ticks += t;
-                calls += c;
+                if (Methods[i].NestedUnder == null)
+                {
+                    ticks += t;
+                    calls += c;
+                }
             }
             TicksWindow[slot] = ticks;
             CallsWindow[slot] = calls;
             TotalTicks += ticks;
             TotalCalls += calls;
+        }
+        internal void FlushTotalsOnly()
+        {
+            for (int i = 0; i < Methods.Count; i++)
+            {
+                Methods[i].FlushTotalsOnly(out long t, out long c);
+                if (Methods[i].NestedUnder == null)
+                {
+                    TotalTicks += t;
+                    TotalCalls += c;
+                }
+            }
+        }
+
+        internal void DropPending()
+        {
+            for (int i = 0; i < Methods.Count; i++)
+                Methods[i].DropPending();
         }
 
         internal void ResetWindow()

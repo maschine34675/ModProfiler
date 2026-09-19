@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using BepInEx;
 using BepInEx.Bootstrap;
+using Comfort.Common;
 using HarmonyLib;
 using UnityEngine;
 
@@ -14,6 +15,8 @@ namespace ModProfiler.Profiling
 {
     internal static class Instrumenter
     {
+        internal const string TimerOwnerId = Plugin.PluginGuid + ".timing";
+
         private static Harmony _harmony;
         private static readonly HashSet<MethodBase> Patched = new HashSet<MethodBase>();
         private static readonly Dictionary<Assembly, ModStats> ModsByAssembly = new Dictionary<Assembly, ModStats>();
@@ -29,25 +32,37 @@ namespace ModProfiler.Profiling
             try
             {
                 if (_harmony == null)
-                    _harmony = new Harmony(Plugin.PluginGuid + ".timing");
+                    _harmony = new Harmony(TimerOwnerId);
+
+                bool rescan = ProfilerCore.Instrumented;
+                if (rescan)
+                    ProfilerCore.RescanCount++;
+                else
+                    ProfilerCore.GcCollectionsAtReset = ProfilerCore.GcCount();
 
                 RefreshModMap();
 
                 var stats = new Dictionary<MethodBase, MethodStats>(ProfilerCore.StatsByMethod);
                 int before = stats.Count;
 
+                int repaired = rescan ? RepairLostTimers(stats) : 0;
+
                 if (Plugin.ProfileHarmonyPatches.Value)
                     ScanHarmonyPatches(stats);
                 if (Plugin.ProfileMonoBehaviours.Value || Plugin.ProfileCoroutines.Value)
                     ScanTypes(stats);
+                if (Plugin.ProfileVanilla.Value)
+                    InstrumentVanilla(stats);
 
                 ProfilerCore.StatsByMethod = stats;
                 ProfilerCore.Instrumented = true;
+                Calibration.Run(_harmony);
 
                 int added = stats.Count - before;
                 Plugin.Log.LogInfo(
                     $"instrumented {stats.Count} methods across {ProfilerCore.Mods.Count} mods " +
-                    $"(+{added} new, {ProfilerCore.PatchFailures} failures)");
+                    $"(+{added} new, {ProfilerCore.PatchFailures} failures" +
+                    (repaired > 0 ? $", {repaired} timers reinstated" : "") + ")");
                 return added;
             }
             finally
@@ -55,6 +70,60 @@ namespace ModProfiler.Profiling
                 ProfilerCore.Active = wasActive;
                 ProfilerCore.SkipNextFlush = true;
             }
+        }
+        internal static bool HasTimer(MethodBase method)
+        {
+            try
+            {
+                Patches info = Harmony.GetPatchInfo(method);
+                return info != null && info.Owners.Contains(TimerOwnerId);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        internal static bool TimersIntact(int sampleSize)
+        {
+            Dictionary<MethodBase, MethodStats> stats = ProfilerCore.StatsByMethod;
+            if (stats.Count == 0)
+                return true;
+            int stride = Math.Max(1, stats.Count / Math.Max(1, sampleSize));
+            int i = 0;
+            foreach (MethodBase method in stats.Keys)
+            {
+                if (i++ % stride != 0)
+                    continue;
+                if (!HasTimer(method))
+                    return false;
+            }
+            return true;
+        }
+        private static int RepairLostTimers(Dictionary<MethodBase, MethodStats> stats)
+        {
+            int repaired = 0;
+            foreach (KeyValuePair<MethodBase, MethodStats> pair in stats)
+            {
+                if (HasTimer(pair.Key))
+                    continue;
+                Patched.Remove(pair.Key);
+                if (ApplyTimer(pair.Key, out string reason))
+                {
+                    Patched.Add(pair.Key);
+                    repaired++;
+                }
+                else
+                {
+                    RecordFailure(pair.Value.Mod, pair.Value.DisplayName,
+                        "reinstating the timer failed: " + (reason ?? "no method body"));
+                    Plugin.Log.LogWarning($"could not reinstate the timer on {pair.Value.DisplayName}: {reason}");
+                }
+            }
+            if (repaired > 0)
+                Plugin.Log.LogWarning(
+                    $"{repaired} timer patches had been removed by another mod's unpatch and were reinstated - " +
+                    "the affected rows measured nothing in between");
+            return repaired;
         }
 
         private static void RefreshModMap()
@@ -79,7 +148,7 @@ namespace ModProfiler.Profiling
                     continue;
                 string location = SafeLocation(asm);
                 if (string.IsNullOrEmpty(location) ||
-                    !location.StartsWith(Paths.PluginPath, StringComparison.OrdinalIgnoreCase))
+                    !location.StartsWith(BepInEx.Paths.PluginPath, StringComparison.OrdinalIgnoreCase))
                     continue;
                 if (!Plugin.IncludeSptPlugins.Value && IsSptAssembly(asm))
                     continue;
@@ -147,12 +216,20 @@ namespace ModProfiler.Profiling
                 if (!ModsByAssembly.TryGetValue(method.DeclaringType.Assembly, out ModStats mod))
                     continue;
 
-                string target = original.DeclaringType != null
-                    ? original.DeclaringType.Name + "." + original.Name
-                    : original.Name;
-                string name = $"{method.DeclaringType.Name}.{method.Name} ({kind} → {target})";
-                Instrument(method, name, "Harmony", mod, stats);
+                Instrument(method, HarmonyDisplayName(method, kind, new[] { original }),
+                    "Harmony", kind, original, mod, stats);
             }
+        }
+        internal static string TargetName(MethodBase original)
+        {
+            return original.DeclaringType != null
+                ? original.DeclaringType.Name + "." + original.Name
+                : original.Name;
+        }
+
+        private static string HarmonyDisplayName(MethodBase patch, string kind, IEnumerable<MethodBase> targets)
+        {
+            return $"{patch.DeclaringType.Name}.{patch.Name} ({kind} → {string.Join(", ", targets.Select(TargetName))})";
         }
 
         private static void ScanTypes(Dictionary<MethodBase, MethodStats> stats)
@@ -192,7 +269,7 @@ namespace ModProfiler.Profiling
                 {
                     MethodInfo method = type.GetMethod(name, DeclaredInstance, null, Type.EmptyTypes, null);
                     if (method != null)
-                        Instrument(method, $"{type.Name}.{name}", "Unity", mod, stats);
+                        Instrument(method, $"{type.Name}.{name}", "Unity", name, null, mod, stats);
                 }
             }
 
@@ -201,9 +278,12 @@ namespace ModProfiler.Profiling
                 MethodInfo method = type.GetMethod("MoveNext", DeclaredInstance, null, Type.EmptyTypes, null);
                 if (method != null)
                 {
-                    string owner = type.DeclaringType != null ? type.DeclaringType.Name + "." : "";
+                    Type ownerType = type.DeclaringType;
+                    while (ownerType != null && ownerType.Name.StartsWith("<", StringComparison.Ordinal))
+                        ownerType = ownerType.DeclaringType;
+                    string owner = ownerType != null ? ownerType.Name + "." : "";
                     Instrument(method, $"{owner}{PrettyStateMachineName(type.Name)} (coroutine/async)",
-                        "Coroutine", mod, stats);
+                        "Coroutine", "MoveNext", null, mod, stats);
                 }
             }
         }
@@ -217,24 +297,233 @@ namespace ModProfiler.Profiling
         private static string PrettyStateMachineName(string raw)
         {
             int lt = raw.IndexOf('<');
-            int gt = raw.IndexOf('>');
-            if (lt >= 0 && gt > lt + 1)
-                return raw.Substring(lt + 1, gt - lt - 1);
-            return raw;
+            int gt = raw.LastIndexOf('>');
+            if (lt < 0 || gt <= lt + 1)
+                return raw;
+            string inner = raw.Substring(lt + 1, gt - lt - 1);
+            if (inner.IndexOf('<') < 0)
+                return inner;
+            int innerGt = inner.LastIndexOf('>');
+            string head = PrettyStateMachineName(inner.Substring(0, innerGt + 1));
+            string tail = inner.Substring(innerGt + 1);
+            return tail.Length > 0 ? head + "." + tail : head;
+        }
+        private readonly struct VanillaEntryPoint
+        {
+            internal readonly string TypeName;
+            internal readonly string MethodName;
+            internal readonly Type[] Parameters;
+            internal readonly string Kind;
+            internal readonly string NestedUnder;
+
+            internal VanillaEntryPoint(string typeName, string methodName, Type[] parameters, string kind, string nestedUnder)
+            {
+                TypeName = typeName;
+                MethodName = methodName;
+                Parameters = parameters;
+                Kind = kind;
+                NestedUnder = nestedUnder;
+            }
+        }
+        private const string GameWorldType = "EFT.GameWorld";
+        private const string DoWorldTickMethod = "DoWorldTick";
+        private const string DoOtherWorldTickMethod = "DoOtherWorldTick";
+
+        private const string DoWorldTickDisplayName = GameWorldType + "." + DoWorldTickMethod;
+        private const string DoOtherWorldTickDisplayName = GameWorldType + "." + DoOtherWorldTickMethod;
+
+        private static readonly VanillaEntryPoint[] CuratedVanillaEntryPoints =
+        {
+            new VanillaEntryPoint(GameWorldType, DoWorldTickMethod,
+                new[] { typeof(float) }, "WorldTick", null),
+            new VanillaEntryPoint(GameWorldType, DoOtherWorldTickMethod,
+                new[] { typeof(float) }, "WorldTick", null),
+            new VanillaEntryPoint("AICoreController", "Update",
+                Type.EmptyTypes, "BotAI-Goals", null),
+            new VanillaEntryPoint("EFT.BotOwner", "UpdateManual",
+                Type.EmptyTypes, "BotAI-Mechanics", null),
+            new VanillaEntryPoint("EFT.UI.InteractionButtonsContainer", "Update",
+                Type.EmptyTypes, "UI", null),
+            new VanillaEntryPoint("EFT.Player", "ComplexUpdate",
+                new[] { typeof(EFT.EUpdateQueue), typeof(float) }, "PlayerUpdate",
+                DoWorldTickDisplayName + " or " + DoOtherWorldTickDisplayName),
+            new VanillaEntryPoint("EFT.Ballistics.BallisticsCalculator", "ManualUpdate",
+                new[] { typeof(float) }, "Ballistics",
+                DoWorldTickDisplayName),
+        };
+        internal static ModStats VanillaMod;
+        private static double _vanillaRaidSeenAt = -1.0;
+        private static int _vanillaRaidWorldId;
+        private static bool _vanillaCoverageChecked;
+        private static bool _updateQueueLogged;
+        private const double VanillaCoverageSeconds = 60.0;
+        private static void InstrumentVanilla(Dictionary<MethodBase, MethodStats> stats)
+        {
+            if (VanillaMod == null)
+            {
+                string name = "EFT (vanilla)";
+                if (ProfilerCore.Mods.Exists(m => m.Name == name))
+                    name = "EFT (vanilla) [profiler]";
+                VanillaMod = new ModStats(name, typeof(EFT.GameWorld).Assembly);
+                ProfilerCore.Mods.Add(VanillaMod);
+            }
+
+            foreach (VanillaEntryPoint e in CuratedVanillaEntryPoints)
+            {
+                Type type = AccessTools.TypeByName(e.TypeName);
+                MethodBase target = type != null
+                    ? AccessTools.Method(type, e.MethodName, e.Parameters)
+                    : null;
+                if (target == null)
+                {
+                    RecordFailure(VanillaMod, $"{e.TypeName}.{e.MethodName}",
+                        "method not found (game version drift?)");
+                    continue;
+                }
+                Instrument(target, $"{e.TypeName}.{e.MethodName}", "EFT", e.Kind,
+                    null, VanillaMod, stats, e.NestedUnder);
+            }
+
+            OrphanOrphanedNestedUnderRows();
+        }
+        private static void OrphanOrphanedNestedUnderRows()
+        {
+            var instrumented = new HashSet<string>();
+            foreach (MethodStats m in VanillaMod.Methods)
+                instrumented.Add(m.DisplayName);
+
+            foreach (MethodStats m in VanillaMod.Methods)
+            {
+                if (m.NestedUnder == null)
+                    continue;
+                string[] alternatives = m.NestedUnder.Split(
+                    new[] { " or " }, StringSplitOptions.None);
+                bool anyParentPresent = false;
+                foreach (string alt in alternatives)
+                {
+                    if (instrumented.Contains(alt))
+                    {
+                        anyParentPresent = true;
+                        break;
+                    }
+                }
+                if (!anyParentPresent)
+                {
+                    Plugin.Log.LogWarning($"{m.NestedUnder} failed to instrument - "
+                        + $"{m.DisplayName} is no longer covered by its normal parent "
+                        + "and is now counted directly in the EFT (vanilla) total instead, "
+                        + "so per-call attribution may look off.");
+                    m.NestedUnder = null;
+                }
+            }
+        }
+        private static void LogVanillaUpdateQueueOnce(EFT.GameWorld gameWorld)
+        {
+            if (_updateQueueLogged)
+                return;
+            _updateQueueLogged = true;
+            try
+            {
+                Plugin.Log.LogDebug($"GameWorld.UpdateQueue = {gameWorld.UpdateQueue} "
+                    + "(determines whether DoWorldTick runs in Update or FixedUpdate this raid)");
+            }
+            catch
+            {
+            }
+        }
+        private static EFT.GameWorld RaidWorld()
+        {
+            if (!Singleton<EFT.GameWorld>.Instantiated)
+                return null;
+            EFT.GameWorld world = Singleton<EFT.GameWorld>.Instance;
+            if (!(world is EFT.ClientGameWorld) || world is HideoutGameWorld || world is NarrateGameWorld)
+                return null;
+            return world.MainPlayer != null ? world : null;
+        }
+        internal static void CheckVanillaCoverageIfDue()
+        {
+            if (_vanillaCoverageChecked || VanillaMod == null)
+                return;
+            EFT.GameWorld world = RaidWorld();
+            if (world == null)
+            {
+                _vanillaRaidSeenAt = -1.0;
+                return;
+            }
+            int worldId = world.GetInstanceID();
+            if (_vanillaRaidSeenAt < 0.0 || worldId != _vanillaRaidWorldId
+                || ProfilerCore.MeasuredSeconds < _vanillaRaidSeenAt)
+            {
+                _vanillaRaidWorldId = worldId;
+                _vanillaRaidSeenAt = ProfilerCore.MeasuredSeconds;
+                LogVanillaUpdateQueueOnce(world);
+                return;
+            }
+            if (ProfilerCore.MeasuredSeconds - _vanillaRaidSeenAt < VanillaCoverageSeconds)
+                return;
+            _vanillaCoverageChecked = true;
+            foreach (MethodStats m in VanillaMod.Methods)
+                if (m.TotalCalls == 0L)
+                    Plugin.Log.LogWarning($"{m.DisplayName} recorded no calls in the first measured minute "
+                        + "of this raid - either nothing in this raid ran it (an inactive UI container or a "
+                        + "raid without bots counts too), or it was inlined before the patch could attach, "
+                        + "and EFT (vanilla) undercounts it.");
         }
 
-        private static void Instrument(MethodBase target, string displayName, string category,
-            ModStats mod, Dictionary<MethodBase, MethodStats> stats)
+        private static void Instrument(MethodBase target, string displayName, string category, string kind,
+            MethodBase original, ModStats mod, Dictionary<MethodBase, MethodStats> stats, string nestedUnder = null)
         {
-            if (stats.ContainsKey(target) || Patched.Contains(target))
+            if (stats.TryGetValue(target, out MethodStats known))
+            {
+                if (original != null && known.Targets != null && !known.Targets.Contains(original))
+                {
+                    known.Targets.Add(original);
+                    if (known.Kind.IndexOf(kind, StringComparison.Ordinal) < 0)
+                        known.Kind = known.Kind + "+" + kind;
+                    known.DisplayName = HarmonyDisplayName(target, known.Kind, known.Targets);
+                }
+                return;
+            }
+            if (Patched.Contains(target))
                 return;
             if (target.IsAbstract || target.IsGenericMethod || target.ContainsGenericParameters)
                 return;
 
+            if (!ApplyTimer(target, out string reason))
+            {
+                if (reason == null)
+                    return;
+                RecordFailure(mod, displayName, reason);
+                Plugin.Log.LogDebug($"could not instrument {target.DeclaringType?.FullName}.{target.Name}: {reason}");
+                return;
+            }
+
+            Patched.Add(target);
+            var methodStats = new MethodStats(target, displayName, category, kind, mod, nestedUnder);
+            if (original != null)
+                methodStats.Targets = new List<MethodBase> { original };
+            mod.Methods.Add(methodStats);
+            stats[target] = methodStats;
+        }
+
+        private static void RecordFailure(ModStats mod, string displayName, string reason)
+        {
+            ProfilerCore.PatchFailures++;
+            if (ProfilerCore.PatchFailureDetails.Count < ProfilerCore.MaxPatchFailureDetails)
+                ProfilerCore.PatchFailureDetails.Add(new ProfilerCore.PatchFailure
+                {
+                    Mod = mod.Name,
+                    Method = displayName,
+                    Reason = reason,
+                });
+        }
+        private static bool ApplyTimer(MethodBase target, out string reason)
+        {
+            reason = null;
             try
             {
                 if (target.GetMethodBody() == null)
-                    return;
+                    return false;
                 _harmony.Patch(target,
                     prefix: new HarmonyMethod(AccessTools.Method(typeof(ProfilerCore), nameof(ProfilerCore.TimerPrefix)))
                     {
@@ -244,31 +533,20 @@ namespace ModProfiler.Profiling
                     {
                         priority = Priority.Last
                     });
+                return true;
             }
             catch (Exception e)
             {
-                ProfilerCore.PatchFailures++;
                 Exception cause = e;
                 while (cause.InnerException != null)
                     cause = cause.InnerException;
-                string reason = (cause.Message ?? cause.GetType().Name).Split('\n')[0].Trim();
+                reason = (cause.Message ?? cause.GetType().Name).Split('\n')[0].Trim();
                 if (reason.Length > 200)
                     reason = reason.Substring(0, 200) + "...";
-                if (ProfilerCore.PatchFailureDetails.Count < ProfilerCore.MaxPatchFailureDetails)
-                    ProfilerCore.PatchFailureDetails.Add(new ProfilerCore.PatchFailure
-                    {
-                        Mod = mod.Name,
-                        Method = displayName,
-                        Reason = reason,
-                    });
-                Plugin.Log.LogDebug($"could not instrument {target.DeclaringType?.FullName}.{target.Name}: {reason}");
-                return;
+                if (reason.Length == 0)
+                    reason = cause.GetType().Name;
+                return false;
             }
-
-            Patched.Add(target);
-            var methodStats = new MethodStats(target, displayName, category, mod);
-            mod.Methods.Add(methodStats);
-            stats[target] = methodStats;
         }
     }
 }

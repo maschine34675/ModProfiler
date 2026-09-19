@@ -24,6 +24,8 @@ namespace ModProfiler.UI
         private sealed class MethodRow
         {
             internal string Name;
+            internal string Growth;
+            internal string NestedUnder;
             internal string Category;
             internal double AvgMs;
             internal double MaxMs;
@@ -39,6 +41,7 @@ namespace ModProfiler.UI
             internal double Calls;
             internal double Percent;
             internal double TotalMs;
+            internal bool Growing;
             internal List<MethodRow> Methods = new List<MethodRow>();
         }
 
@@ -59,7 +62,9 @@ namespace ModProfiler.UI
         private readonly List<ModRow> _rows = new List<ModRow>();
         private float _nextRefresh;
         private string _headerText = "";
+        private string _memText = "";
         private string _statusText = "";
+        private float _statusUntil;
 
         private GUIStyle _rowStyle;
         private GUIStyle _numStyle;
@@ -74,17 +79,17 @@ namespace ModProfiler.UI
 
         private void Update()
         {
+            FrameClock.OnUpdate();
             if (!WebPanelController.OwnsHotkey && Hotkey.IsPressed(Plugin.ToggleKey.Value))
                 Toggle();
-
-            if (ProfilerCore.Active)
-                ProfilerCore.FlushFrame(Time.unscaledDeltaTime * 1000f);
+            string exportMessage = CsvExport.Poll();
+            if (exportMessage != null)
+                SetStatus(exportMessage);
+            CsvExport.AutoTick();
 
             if (!_visible)
                 return;
 
-            if (_mouseMode)
-                UnlockCursor();
             UpdateEventSystemSuppression();
 
             if (Time.unscaledTime >= _nextRefresh)
@@ -93,12 +98,16 @@ namespace ModProfiler.UI
                 _nextRefresh = Time.unscaledTime + Plugin.RefreshInterval.Value;
             }
         }
-
-        private void LateUpdate()
+        private void FixedUpdate()
         {
-            if (_visible && _mouseMode)
-                UnlockCursor();
+            ProfilerCore.CountFixedStep();
         }
+        private void SetStatus(string text)
+        {
+            _statusText = text;
+            _statusUntil = Time.unscaledTime + 10f;
+        }
+
 
         private void OnDestroy()
         {
@@ -106,14 +115,10 @@ namespace ModProfiler.UI
             RestoreEventSystem();
         }
 
-        private static void UnlockCursor()
-        {
-            Cursor.lockState = CursorLockMode.None;
-            Cursor.visible = true;
-        }
-
         private void SetMouseMode(bool on)
         {
+            if (on != _mouseMode)
+                CursorRequestNode.Want(on);
             _mouseMode = on;
             GameInputBlocker.Blocked = on;
         }
@@ -157,7 +162,7 @@ namespace ModProfiler.UI
             if (_visible)
             {
                 _visible = false;
-                ProfilerCore.Active = false;
+                ProfilerCore.SetActive(false);
                 SetMouseMode(false);
                 RestoreEventSystem();
                 return;
@@ -170,7 +175,7 @@ namespace ModProfiler.UI
             }
 
             ProfilerCore.ResetWindows();
-            ProfilerCore.Active = true;
+            ProfilerCore.SetActive(true);
             _visible = true;
             _nextRefresh = 0f;
         }
@@ -198,6 +203,10 @@ namespace ModProfiler.UI
                 row.Percent = frameAvgMs > 0.0 ? row.AvgMs / frameAvgMs * 100.0 : 0.0;
                 profiledAvgMs += row.AvgMs;
 
+                foreach (MethodStats m in mod.Methods)
+                    if (m.Growth != null && m.Growth.Growing)
+                        row.Growing = true;
+
                 if (_expanded.Contains(mod))
                 {
                     var methods = new List<MethodRow>(mod.Methods.Count);
@@ -206,6 +215,12 @@ namespace ModProfiler.UI
                         methods.Add(new MethodRow
                         {
                             Name = m.DisplayName,
+                            NestedUnder = m.NestedUnder,
+                            Growth = m.Growth != null && m.Growth.Growing
+                                ? $"            growing: {m.Growth.From:F1} → {m.Growth.To:F1} per frame over " +
+                                  $"{Math.Max(0.0, (ProfilerCore.MeasuredSeconds - m.Growth.SinceSeconds) / 60.0):F0} measured min" +
+                                  " - a leak candidate if it never falls back"
+                                : null,
                             Category = m.Category,
                             AvgMs = m.WindowAvgMs(frames),
                             MaxMs = m.WindowMaxMs(frames),
@@ -215,6 +230,9 @@ namespace ModProfiler.UI
                     }
                     methods.Sort((a, b) => b.AvgMs.CompareTo(a.AvgMs));
                     int n = Math.Min(Plugin.TopMethodsPerMod.Value, methods.Count);
+                    for (int i = n; i < methods.Count; i++)
+                        if (methods[i].Growth != null)
+                            methods[n++] = methods[i];
                     row.Methods = methods.GetRange(0, n);
                 }
 
@@ -224,10 +242,20 @@ namespace ModProfiler.UI
             SortRows();
 
             double fps = frameAvgMs > 0.0 ? 1000.0 / frameAvgMs : 0.0;
+            TimeSpan measured = TimeSpan.FromSeconds(ProfilerCore.MeasuredSeconds);
             _headerText =
                 $"Frame Ø {frameAvgMs:F1} ms ({fps:F0} FPS)  |  profiled mods Σ {profiledAvgMs:F2} ms/frame  |  " +
-                $"{ProfilerCore.StatsByMethod.Count} methods, window {frames} frames" +
+                $"{ProfilerCore.StatsByMethod.Count} methods, window {frames}, measured {ProfilerCore.TotalFrames:N0} frames " +
+                $"/ {(int)measured.TotalMinutes}:{measured.Seconds:00}" +
+                (CsvExport.LastExportAt.HasValue ? $"  |  exported {CsvExport.LastExportAt.Value:HH:mm:ss}" : "") +
                 (ProfilerCore.PatchFailures > 0 ? $"  |  {ProfilerCore.PatchFailures} patch failures" : "");
+            _memText =
+                $"GC {(ProfilerCore.GcModeEnabled ? "on" : "off")}" +
+                (ProfilerCore.GcModeEnabled ? $" {ProfilerCore.GcPerSecond:F1}/s" : "") +
+                $"  |  heap {ProfilerCore.HeapMb:F0} MB (peak {ProfilerCore.HeapPeakMb:F0})" +
+                (GcHeapSource.Available
+                    ? $", alloc {ProfilerCore.AllocMbS:F1} MB/s" + (GcHeapSource.PerThreadCounter ? "" : " (heap delta)")
+                    : ", alloc rate n/a");
         }
 
         private void SortRows()
@@ -281,7 +309,7 @@ namespace ModProfiler.UI
         {
             GUILayout.BeginHorizontal();
             if (GUILayout.Button(ProfilerCore.Active ? "Pause" : "Resume", GUILayout.Width(70f)))
-                ProfilerCore.Active = !ProfilerCore.Active;
+                ProfilerCore.SetActive(!ProfilerCore.Active);
             if (GUILayout.Button("Rescan", GUILayout.Width(70f)))
             {
                 Instrumenter.InstrumentAll();
@@ -297,12 +325,12 @@ namespace ModProfiler.UI
             string mouseLabel = _mouseMode ? "Mouse ✓" : "Mouse";
             if (GUILayout.Button(mouseLabel, GUILayout.Width(80f)))
                 SetMouseMode(!_mouseMode);
-            GUILayout.Space(12f);
-            GUILayout.Label(_headerText, _headStyle);
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("X", GUILayout.Width(26f)))
                 Toggle();
             GUILayout.EndHorizontal();
+            GUILayout.Label(_headerText, _headStyle);
+            GUILayout.Label(_memText, _headStyle);
 
             DrawHeaderRow();
 
@@ -311,7 +339,7 @@ namespace ModProfiler.UI
                 DrawModRow(_rows[i]);
             GUILayout.EndScrollView();
 
-            if (!string.IsNullOrEmpty(_statusText))
+            if (!string.IsNullOrEmpty(_statusText) && Time.unscaledTime < _statusUntil)
                 GUILayout.Label(_statusText, _headStyle);
 
             GUI.DragWindow(new Rect(0f, 0f, 100000f, 20f));
@@ -352,7 +380,7 @@ namespace ModProfiler.UI
             bool expanded = _expanded.Contains(row.Mod);
 
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button((expanded ? "▼ " : "▶ ") + row.Mod.Name, _rowStyle, GUILayout.Width(NameWidth)))
+            if (GUILayout.Button((expanded ? "▼ " : "▶ ") + (row.Growing ? "▲ " : "") + row.Mod.Name, _rowStyle, GUILayout.Width(NameWidth)))
             {
                 if (expanded)
                     _expanded.Remove(row.Mod);
@@ -374,13 +402,18 @@ namespace ModProfiler.UI
             {
                 MethodRow m = row.Methods[i];
                 GUILayout.BeginHorizontal();
-                GUILayout.Label("      [" + m.Category[0] + "] " + m.Name, _methodStyle, GUILayout.Width(NameWidth));
+                string prefix = m.NestedUnder != null ? "↳ " : (m.Growth != null ? "▲ " : "");
+                GUILayout.Label("      [" + m.Category[0] + "] " + prefix + m.Name, _methodStyle, GUILayout.Width(NameWidth));
                 GUILayout.Label(m.AvgMs.ToString("F3"), _methodNumStyle, GUILayout.Width(NumWidth));
                 GUILayout.Label(m.MaxMs.ToString("F3"), _methodNumStyle, GUILayout.Width(NumWidth));
                 GUILayout.Label(m.Calls.ToString("F1"), _methodNumStyle, GUILayout.Width(NumWidth));
                 GUILayout.Label("", _methodNumStyle, GUILayout.Width(NumWidth));
                 GUILayout.Label(m.TotalMs.ToString("F0"), _methodNumStyle, GUILayout.Width(TotalWidth));
                 GUILayout.EndHorizontal();
+                if (m.Growth != null)
+                    GUILayout.Label(m.Growth, _methodStyle);
+                if (m.NestedUnder != null)
+                    GUILayout.Label($"            counted inside {m.NestedUnder}'s row above - not additional time", _methodStyle);
             }
         }
 
@@ -388,12 +421,11 @@ namespace ModProfiler.UI
         {
             try
             {
-                _statusText = "CSV written: " + CsvExport.Write();
-                Plugin.Log.LogInfo(_statusText);
+                SetStatus(CsvExport.Begin("manual"));
             }
             catch (Exception e)
             {
-                _statusText = "CSV export failed: " + e.Message;
+                SetStatus("CSV export failed: " + e.Message);
                 Plugin.Log.LogError(_statusText);
             }
         }

@@ -3,3 +3,4 @@ obj/
 *.zip
 *.user
 .vs/
+Thumbs.db

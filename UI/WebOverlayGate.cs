@@ -7,7 +7,7 @@ namespace ModProfiler.UI
     internal static class WebOverlayGate
     {
         public const string LibraryGuid = "com.anvil.weboverlay";
-        public static readonly Version MinimumVersion = new Version(1, 8, 0);
+        public static readonly Version MinimumVersion = new Version(1, 8, 8);
 
         private static bool? loaded;
         private static Version foundVersion;
@@ -48,6 +48,7 @@ namespace ModProfiler.UI
                     CloseKeys = WebOverlay.WebOverlayPlugin.CloseKeysFor(toggleKey),
                     Dispatch = WebOverlay.EventDispatch.Manual,
                     FreeCursorWhileShown = true,
+                    ClickThroughWhenUnfocused = true,
                 });
                 if (handle == null)
                 {
