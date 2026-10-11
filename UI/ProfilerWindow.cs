@@ -82,6 +82,7 @@ namespace ModProfiler.UI
             FrameClock.OnUpdate();
             if (!WebPanelController.OwnsHotkey && Hotkey.IsPressed(Plugin.ToggleKey.Value))
                 Toggle();
+            HeadlessCapture.Poll();
             string exportMessage = CsvExport.Poll();
             if (exportMessage != null)
                 SetStatus(exportMessage);
@@ -173,8 +174,8 @@ namespace ModProfiler.UI
                 Plugin.Log.LogInfo("first activation - instrumenting all mod code, this can take a moment...");
                 Instrumenter.InstrumentAll();
             }
-
-            ProfilerCore.ResetWindows();
+            if (!ProfilerCore.Active)
+                ProfilerCore.ResetWindows();
             ProfilerCore.SetActive(true);
             _visible = true;
             _nextRefresh = 0f;
@@ -255,7 +256,8 @@ namespace ModProfiler.UI
                 $"  |  heap {ProfilerCore.HeapMb:F0} MB (peak {ProfilerCore.HeapPeakMb:F0})" +
                 (GcHeapSource.Available
                     ? $", alloc {ProfilerCore.AllocMbS:F1} MB/s" + (GcHeapSource.PerThreadCounter ? "" : " (heap delta)")
-                    : ", alloc rate n/a");
+                    : ", alloc rate n/a") +
+                (ProfilerCore.CaptureHeld ? "  |  headless capture running (Capture/Headless)" : "");
         }
 
         private void SortRows()
@@ -308,8 +310,11 @@ namespace ModProfiler.UI
         private void DrawWindow(int id)
         {
             GUILayout.BeginHorizontal();
+            bool wasEnabled = GUI.enabled;
+            GUI.enabled = wasEnabled && !ProfilerCore.CaptureHeld;
             if (GUILayout.Button(ProfilerCore.Active ? "Pause" : "Resume", GUILayout.Width(70f)))
                 ProfilerCore.SetActive(!ProfilerCore.Active);
+            GUI.enabled = wasEnabled;
             if (GUILayout.Button("Rescan", GUILayout.Width(70f)))
             {
                 Instrumenter.InstrumentAll();
@@ -421,7 +426,7 @@ namespace ModProfiler.UI
         {
             try
             {
-                SetStatus(CsvExport.Begin("manual"));
+                SetStatus(CsvExport.Begin(CsvExport.TriggerManual));
             }
             catch (Exception e)
             {

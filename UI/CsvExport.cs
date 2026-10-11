@@ -17,6 +17,10 @@ namespace ModProfiler.UI
     internal static class CsvExport
     {
         internal const int Format = 2;
+        internal const string TriggerManual = "manual";
+        internal const string TriggerAuto = "auto";
+        internal const string TriggerHeadlessStart = "headless-start";
+        internal const string TriggerHeadlessStop = "headless-stop";
         internal static DateTime? LastExportAt;
         internal static string LastExportMessage;
 
@@ -26,6 +30,21 @@ namespace ModProfiler.UI
             internal long Ticks;
             internal long Calls;
         }
+        private struct ModRow
+        {
+            internal string Name;
+            internal int Methods;
+            internal int MethodsNew;
+            internal long Calls;
+            internal double TotalMs;
+            internal double MsPerFrame;
+            internal double CallsPerFrame;
+            internal bool HasDelta;
+            internal long CallsDelta;
+            internal double MsDelta;
+            internal double MsPerFrameDelta;
+            internal double CallsPerFrameDelta;
+        }
 
         private sealed class Outcome
         {
@@ -34,6 +53,7 @@ namespace ModProfiler.UI
             internal string Path;
             internal bool Ok;
             internal string Error;
+            internal string PointerError;
             internal DateTime Time;
             internal int Index;
             internal long Frames;
@@ -43,15 +63,26 @@ namespace ModProfiler.UI
         }
 
         private static readonly ConcurrentQueue<Outcome> finished = new ConcurrentQueue<Outcome>();
+        private static readonly PointerFile pointer = new PointerFile();
+        private static string lastPointerError;
+
+        internal static string ExportsRoot =>
+            Path.Combine(BepInEx.Paths.PluginPath, "maschine-ModProfiler", "exports");
+        internal static string SessionFolder =>
+            ProfilerCore.SessionStart.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+        internal static string PointerFileName => PointerFile.NameFor(Environment.MachineName);
         private static readonly HashSet<string> inFlight = new HashSet<string>();
         internal static string Begin(string trigger)
         {
             if (ProfilerCore.Active)
                 ProfilerCore.SkipNextFlush = true;
 
-            string dir = Path.Combine(BepInEx.Paths.PluginPath, "maschine-ModProfiler", "exports",
-                ProfilerCore.SessionStart.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
+            string sessionFolder = SessionFolder;
+            string dir = Path.Combine(ExportsRoot, sessionFolder);
             Directory.CreateDirectory(dir);
+            string pointerPath = ProfilerCore.CaptureHeld || trigger == TriggerHeadlessStop
+                ? Path.Combine(ExportsRoot, PointerFileName)
+                : null;
 
             DateTime now = DateTime.Now;
             string baseName = UniqueBaseName(dir, "modprofiler-" + now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
@@ -71,9 +102,10 @@ namespace ModProfiler.UI
                                       "Harmony.UnpatchAll() may have removed them; press Rescan to reinstate them");
 
             var rows = new List<RowBaseline>(ProfilerCore.StatsByMethod.Count);
-            string csv = BuildCsv(committed, deltaFrames, rows, out int idleRows);
-            string json = BuildSidecar(now, index, trigger, baseName + ".csv", sinceReset, deltaValid,
-                deltaFrames, deltaSeconds, previousFile, idleRows, timersIntact);
+            var mods = new List<ModRow>(ProfilerCore.Mods.Count);
+            string csv = BuildCsv(committed, deltaFrames, rows, mods, out int idleRows);
+            string json = BuildSidecar(now, index, trigger, sessionFolder, baseName + ".csv", sinceReset, deltaValid,
+                deltaFrames, deltaSeconds, previousFile, idleRows, timersIntact, mods);
 
             var outcome = new Outcome
             {
@@ -98,6 +130,17 @@ namespace ModProfiler.UI
                 {
                     outcome.Error = e.Message;
                 }
+                if (outcome.Ok && pointerPath != null)
+                {
+                    try
+                    {
+                        pointer.Write(pointerPath, json, index);
+                    }
+                    catch (Exception e)
+                    {
+                        outcome.PointerError = e.Message;
+                    }
+                }
                 outcome.Time = DateTime.Now;
                 finished.Enqueue(outcome);
             });
@@ -110,7 +153,8 @@ namespace ModProfiler.UI
             while (finished.TryDequeue(out Outcome outcome))
             {
                 inFlight.Remove(outcome.BaseName);
-                bool auto = outcome.Trigger == "auto";
+                bool auto = outcome.Trigger == TriggerAuto;
+                bool stop = outcome.Trigger == TriggerHeadlessStop;
                 if (outcome.Ok)
                 {
                     Commit(outcome);
@@ -124,14 +168,22 @@ namespace ModProfiler.UI
                     else
                     {
                         message = "CSV written: " + outcome.Path;
-                        Plugin.Log.LogInfo(message);
+                        Plugin.Log.LogInfo(!stop ? message
+                            : "headless capture stopped: final export " + outcome.Path
+                              + (outcome.PointerError != null ? " (pointer file not updated)" : ""));
                     }
+                    if (outcome.PointerError != null && (stop || outcome.PointerError != lastPointerError))
+                        Plugin.Log.LogWarning("export written, but the pointer file " + PointerFileName
+                            + " could not be replaced: " + outcome.PointerError);
+                    lastPointerError = outcome.PointerError;
                 }
                 else
                 {
                     message = (auto ? "auto-export failed: " : "CSV export failed: ") + outcome.Error;
                     if (!auto || outcome.Error != lastAutoError)
-                        Plugin.Log.LogError(message);
+                        Plugin.Log.LogError(stop
+                            ? "headless capture ended without a final export - writing it failed: " + outcome.Error
+                            : message);
                     if (auto)
                         lastAutoError = outcome.Error;
                 }
@@ -158,7 +210,7 @@ namespace ModProfiler.UI
             autoExportedAt = now;
             try
             {
-                Begin("auto");
+                Begin(TriggerAuto);
             }
             catch (Exception e)
             {
@@ -169,6 +221,10 @@ namespace ModProfiler.UI
             }
         }
         internal const float MinAutoExportSeconds = 10f;
+        internal static void RestartAutoInterval()
+        {
+            autoExportedAt = ProfilerCore.MeasuredSeconds;
+        }
 
         private static void Commit(Outcome outcome)
         {
@@ -202,7 +258,8 @@ namespace ModProfiler.UI
             return candidate;
         }
 
-        private static string BuildCsv(int committed, long deltaFrames, List<RowBaseline> rows, out int idleRows)
+        private static string BuildCsv(int committed, long deltaFrames, List<RowBaseline> rows, List<ModRow> mods,
+            out int idleRows)
         {
             idleRows = 0;
             var targetsThatRan = new HashSet<MethodBase>();
@@ -221,8 +278,10 @@ namespace ModProfiler.UI
             var flags = new List<string>(4);
             foreach (ModStats mod in ProfilerCore.Mods)
             {
+                var sum = new ModRow { Name = mod.Name };
                 foreach (MethodStats m in mod.Methods)
                 {
+                    bool counted = m.NestedUnder == null;
                     long frames = m.FramesSeen();
                     double totalMs = m.TotalTicks * ProfilerCore.MsPerTick;
                     double maxMs = m.MaxMainFrameTicks * ProfilerCore.MsPerTick;
@@ -231,6 +290,16 @@ namespace ModProfiler.UI
                     double callsPerFrame = frames > 0 ? (double)m.TotalCalls / frames : 0.0;
                     double usPerCall = m.TotalCalls > 0 ? totalMs * 1000.0 / m.TotalCalls : 0.0;
                     bool isNew = committed > 0 && m.SeenAtExport != committed;
+                    if (counted)
+                    {
+                        sum.Methods++;
+                        if (isNew)
+                            sum.MethodsNew++;
+                        sum.Calls += m.TotalCalls;
+                        sum.TotalMs += totalMs;
+                        sum.MsPerFrame += msPerFrame;
+                        sum.CallsPerFrame += callsPerFrame;
+                    }
 
                     flags.Clear();
                     if (m.TotalCalls == 0)
@@ -282,10 +351,20 @@ namespace ModProfiler.UI
                         long callsDelta = m.TotalCalls - m.ExportCalls;
                         double msDelta = (m.TotalTicks - m.ExportTicks) * ProfilerCore.MsPerTick;
                         long intervalFrames = Math.Min(deltaFrames, frames);
+                        double msPerFrameDelta = intervalFrames > 0 ? msDelta / intervalFrames : 0.0;
+                        double callsPerFrameDelta = intervalFrames > 0 ? (double)callsDelta / intervalFrames : 0.0;
                         sb.Append(callsDelta.ToString(CultureInfo.InvariantCulture)).Append(',');
                         Num(sb, msDelta, 3).Append(',');
-                        Num(sb, intervalFrames > 0 ? msDelta / intervalFrames : 0.0, 5).Append(',');
-                        Num(sb, intervalFrames > 0 ? (double)callsDelta / intervalFrames : 0.0, 4).Append(',');
+                        Num(sb, msPerFrameDelta, 5).Append(',');
+                        Num(sb, callsPerFrameDelta, 4).Append(',');
+                        if (counted)
+                        {
+                            sum.HasDelta = true;
+                            sum.CallsDelta += callsDelta;
+                            sum.MsDelta += msDelta;
+                            sum.MsPerFrameDelta += msPerFrameDelta;
+                            sum.CallsPerFrameDelta += callsPerFrameDelta;
+                        }
                     }
 
                     sb.Append(string.Join(" ", flags)).Append(',')
@@ -293,6 +372,8 @@ namespace ModProfiler.UI
 
                     rows.Add(new RowBaseline { Row = m, Ticks = m.TotalTicks, Calls = m.TotalCalls });
                 }
+                if (sum.Methods > 0)
+                    mods.Add(sum);
             }
             return sb.ToString();
         }
@@ -314,9 +395,9 @@ namespace ModProfiler.UI
             return string.Join(";", names);
         }
 
-        private static string BuildSidecar(DateTime now, int index, string trigger, string csvFile,
-            bool sinceReset, bool deltaValid, long deltaFrames, double deltaSeconds, string previousFile,
-            int idleRows, bool timersIntact)
+        private static string BuildSidecar(DateTime now, int index, string trigger, string sessionFolder,
+            string csvFile, bool sinceReset, bool deltaValid, long deltaFrames, double deltaSeconds,
+            string previousFile, int idleRows, bool timersIntact, List<ModRow> mods)
         {
             var sb = new StringBuilder(16 * 1024);
             var json = new JsonBuilder(sb);
@@ -328,6 +409,7 @@ namespace ModProfiler.UI
                     .Value("time", now.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture))
                     .Value("index", index)
                     .Value("trigger", trigger)
+                    .Value("dir", sessionFolder)
                     .Value("csv_file", csvFile)
                 .EndObject()
                 .BeginObject("game")
@@ -351,6 +433,7 @@ namespace ModProfiler.UI
                     .Value("avg_fps", ProfilerCore.MeasuredSeconds > 0.0
                         ? (ProfilerCore.TotalFrames - ProfilerCore.SkippedFrames) / ProfilerCore.MeasuredSeconds : 0.0, 1)
                     .Value("active", ProfilerCore.Active)
+                    .Value("headless", ProfilerCore.CaptureHeld)
                     .Value("reset_count", ProfilerCore.ResetCount)
                     .Value("rescan_count", ProfilerCore.RescanCount)
                     .Value("instrumented_methods", ProfilerCore.StatsByMethod.Count)
@@ -374,6 +457,24 @@ namespace ModProfiler.UI
                     .Value("previous_file", sinceReset ? null : previousFile)
                     .Value("valid", deltaValid)
                 .EndObject()
+                .BeginArray("mods");
+            foreach (ModRow mod in mods)
+            {
+                json.BeginObject()
+                    .Value("name", mod.Name)
+                    .Value("methods", mod.Methods)
+                    .Value("methods_new", mod.MethodsNew)
+                    .Value("calls", mod.Calls)
+                    .Value("total_ms", mod.TotalMs, 3)
+                    .Value("ms_per_frame", mod.MsPerFrame, 5)
+                    .Value("calls_per_frame", mod.CallsPerFrame, 4)
+                    .ValueOrNull("calls_delta", mod.HasDelta ? mod.CallsDelta : double.NaN, 0)
+                    .ValueOrNull("total_ms_delta", mod.HasDelta ? mod.MsDelta : double.NaN, 3)
+                    .ValueOrNull("ms_per_frame_delta", mod.HasDelta ? mod.MsPerFrameDelta : double.NaN, 5)
+                    .ValueOrNull("calls_per_frame_delta", mod.HasDelta ? mod.CallsPerFrameDelta : double.NaN, 4)
+                .EndObject();
+            }
+            json.EndArray()
                 .BeginArray("spikes");
             foreach (ProfilerCore.SpikeEntry spike in ProfilerCore.Spikes)
             {

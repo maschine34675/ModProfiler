@@ -68,7 +68,8 @@ culprit behind performance drops without having to disable mods one by one.
 - **Auto-export**: set `CSV/AutoExportIntervalSeconds` (default 0 = off; values below
   10 count as 10) to also write a CSV/sidecar pair on its own, into the same
   per-session export folder as the button above, every that many seconds of
-  *measured* time — a closed or paused window does not add up. The status line then
+  *measured* time — a closed or paused window does not add up, unless a
+  [headless capture](#headless-capture) is measuring. The status line then
   shows "auto-export written: `<file>`"; a successful auto-export is logged at debug
   level only, a failing one once per distinct error, and retried after a full
   interval.
@@ -185,9 +186,12 @@ was instrumented even when it never ran.
 
 Alongside the CSV, per export: `format` (2), `profiler` version, `session_id`,
 `export` (time, index, `trigger` — `manual` for the CSV button, `auto` for the
-auto-export timer — csv file), `game` (Unity, EFT, SPT, WebOverlay versions),
+auto-export timer, `headless-start` / `headless-stop` for the two exports that
+open and close a [headless capture](#headless-capture) — `dir`, the session
+folder, and the csv file), `game` (Unity, EFT, SPT, WebOverlay versions),
 `machine` (CPU, GPU, RAM, resolution, refresh rate, VSync, target FPS),
-`measurement` (frames, seconds, average FPS, active, reset/rescan counts,
+`measurement` (frames, seconds, average FPS, active, `headless` — whether a
+headless capture was running — reset/rescan counts,
 instrumented method count, idle row count, patch-failure count, GC collections
 since Reset, `timers_intact` — false when another mod's global Harmony
 `UnpatchAll()` has removed the profiler's own timing patches; the next Rescan
@@ -200,13 +204,26 @@ time, `alloc_source` being `per-thread-counter` or `heap-delta` (a lower bound w
 `gc_mode_enabled` is true), `alloc_mb_s` being `null` instead of `0` only if neither
 source can be read),
 `delta` (since export or Reset, frames, seconds, previous file,
-validity), `spikes` (the last 200 entries of the spike log, each with its `gc`
+validity), `mods` (one entry per mod, see below), `spikes` (the last 200 entries of the spike log, each with its `gc`
 flag and its top contributors — every contributor also carries its own most
 expensive `method` and `method_ms` in that frame; the web window shows the
 latest 20), `growing` (one entry per row currently marked, with `mod`,
 `method`, `from_per_frame`, `to_per_frame` and `measured_minutes`), and
 `patch_failures` (mod, method and reason for every method Harmony could not
 wrap). `game.eft` is the client build as the executable reports it.
+
+`mods` is the CSV added up per mod, by the CSV's own rules, so a per-mod number
+does not need the CSV at all. It has one entry for every mod that has rows in
+the CSV (the mod count in the log lines also includes mods without any):
+`name`, `methods` (the rows that were added up —
+rows flagged `nested` are left out, their time is already inside another row),
+`methods_new` (how many of them are flagged `new`), `calls`, `total_ms`,
+`ms_per_frame` and `calls_per_frame` (since the last Reset, the sum of the mod's
+rows in those columns), and `calls_delta`, `total_ms_delta`,
+`ms_per_frame_delta`, `calls_per_frame_delta` (since the previous export, over
+the rows that have a delta; `null` when none of the mod's rows has one). The
+window's own averages and peaks are not in it: they cover the last 150 frames
+only and would not match an interval of any other length.
 
 ### The row key and delta semantics
 
@@ -225,6 +242,76 @@ fields until the export after it.
 Numbers use a period as the decimal separator (invariant culture). A
 German-locale Excel shows them as text on a plain double-click open; use
 "Data > From Text/CSV" to import the file correctly instead.
+
+## Headless capture
+
+For automated test runs: measuring without opening the window, switched by a
+setting instead of the hotkey, with the results read from the export files.
+Nothing here is needed for ordinary use, and nothing changes while the setting
+stays off.
+
+`Capture/Headless` — an advanced setting, off by default — starts a capture when
+it is switched on and ends it when it is switched off, from the F12 menu or from
+any tool that changes BepInEx settings in the running game. It applies to the
+running game only: a value still on when the game starts is switched back off,
+with a line in the log, so one left behind in the settings file never starts a
+capture on its own.
+
+- **Start.** All mod code is scanned first — the scan of the first window
+  opening, or a Rescan if one has run before, so patches other mods applied in
+  the meantime are covered. That freezes the game for a few seconds. Then an
+  export is begun (`trigger` `headless-start`) and the log says
+  `headless capture running: N methods across M mods, exports in <session> from
+  index <n>, pointer file latest-<machine>.json, ...`. Measuring runs from that
+  line on; a script should wait for it rather than for a fixed time. The files
+  of that first export follow a moment later.
+- **While it runs.** Either window can be opened and closed; neither ends the
+  capture or clears anything. **Pause** is disabled, because it could not stop a
+  capture. **Rescan** works as usual. **Reset** works too, but it starts the
+  counters over in the middle of the series (see below).
+  `CSV/AutoExportIntervalSeconds` adds an export every interval, the first one a
+  full interval after the start; at 0 only the start and the final export are
+  written.
+- **Stop.** A final export is written (`trigger` `headless-stop`), and once its
+  files exist the log says `headless capture stopped: final export <path>`. If
+  that export cannot be written, the log says `headless capture ended without a
+  final export ...` instead — an error line that deliberately does not contain
+  `stopped`.
+
+Every export of a capture also replaces one more file,
+`exports/latest-<machine>.json`: a copy of that export's sidecar under a name
+that does not change, so a script has one file to poll. The machine name is
+part of it because an exports folder that several computers share (a synced
+install) would otherwise have them overwrite each other's file. It is replaced
+as a whole, never written in place; if something else holds it open, the
+profiler waits briefly and, failing that, leaves the old file and logs a
+warning — the export itself is not affected.
+
+For a script reading it:
+
+- Take the session folder and the index from the `running` line and accept only
+  a file whose `export.dir` is that folder and whose `export.index` is that
+  index or higher. Do not compare `export.time` with another machine's clock.
+  After a crash the last file stays behind and looks valid.
+- Retry a file that is missing, locked, empty or does not parse, and expect a
+  network share to show a change some seconds late.
+- `mods` has the per-mod numbers (see the sidecar section above); the first
+  export of a capture is its baseline, so every later export's `*_delta` values
+  cover exactly the time since the export before it.
+- The end of a capture is `export.trigger` `headless-stop`. In that export
+  `measurement.headless` is false, and `measurement.active` is false unless a
+  window is still measuring. The path in the `stopped` line is that export's
+  CSV, with its sidecar next to it; should the line end in `(pointer file not
+  updated)`, read that sidecar instead of the pointer file.
+- A **Reset** during a capture raises `measurement.reset_count`; the next
+  export's deltas are since that Reset and `delta.valid` is false.
+- Switch it on inside the raid, not in the menu before it: some mods only apply
+  their patches at raid start, and a capture started earlier does not see them
+  (`rescan_count` and `instrumented_methods` show whether a later scan added
+  any). Switching it off and on again scans again.
+- Switch it off and wait for `headless capture stopped: final export` before
+  closing the game. Quitting with the capture still running writes no final
+  export.
 
 ## Limits (important for interpretation)
 
@@ -343,7 +430,8 @@ In the order the F12 menu shows them:
 | `UI/RefreshInterval` | 0.5 s | Seconds between table refreshes. |
 | `UI/TopMethodsPerMod` | 15 | How many methods an expanded mod row lists. |
 | `UI/SpikeThresholdMs` | 30 ms | Frames slower than this enter the spike log; 0 disables it. |
-| `CSV/AutoExportIntervalSeconds` | 0 s (off) | Writes a CSV export on its own every this many seconds of measuring (closed or paused time does not count), into the same folder as the CSV button; values below 10 count as 10. |
+| `CSV/AutoExportIntervalSeconds` | 0 s (off) | Writes a CSV export on its own every this many seconds of measuring (closed or paused time does not count, except during a headless capture), into the same folder as the CSV button; values below 10 count as 10. |
+| `Capture/Headless` | off | Advanced, only shown with the menu's advanced settings: measures without the window until switched off again — see [Headless capture](#headless-capture). Always off when the game starts. |
 | `Profiling/HarmonyPatches` | on | Measure the Harmony patches other mods applied. |
 | `Profiling/MonoBehaviours` | on | Measure mod `Update`/`FixedUpdate`/`LateUpdate`/`OnGUI`. |
 | `Profiling/CoroutinesAndAsync` | on | Measure coroutine and async state machine steps. |
@@ -375,6 +463,13 @@ two levels up, so the checkout has to sit inside an SPT installation — clone i
 `Anvil-WebOverlay.dll` reference resolves from
 `<your SPT folder>/BepInEx/plugins/Anvil-WebOverlay/`; without that library installed the
 build fails, since the web window is compiled against it (it stays optional at runtime).
+
+The tests cover the parts that need neither Unity nor the game and run without
+building the plugin — always give the path:
+
+```
+dotnet test tests/ModProfiler.Tests
+```
 
 A successful build copies the DLL to `..\..\BepInEx\plugins\maschine-ModProfiler\` and
 creates the release zip next to the project file. Pass `-p:SkipDeploy=true` to build

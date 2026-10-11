@@ -2,22 +2,70 @@
 
 ## [Unreleased]
 
+## [1.4.0]
+
+### Forge version notes
+
+- Automated test runs can now measure without opening the profiler window: the
+  new advanced setting `Capture/Headless` starts and ends a capture, and a
+  script reads the results from the export files. Nothing changes for you if
+  you never touch it.
+- The export's sidecar file now has one entry per mod, so a per-mod total no
+  longer means adding up the CSV by hand.
+
+### Added
+
+- `Capture/Headless` (advanced, default off): measures without either window
+  from the moment it is switched on until it is switched off. Switching it on
+  scans all mod code first (a Rescan if a scan has run before), writes an
+  export with `trigger` `headless-start` and logs `headless capture running:
+  ...`; switching it off writes one with `trigger` `headless-stop` and logs
+  `headless capture stopped: final export <path>` once its files exist (or,
+  as an error, `headless capture ended without a final export ...`).
+  `CSV/AutoExportIntervalSeconds` adds exports in between, the first a full
+  interval after the start. The windows can be opened and closed meanwhile
+  without ending the capture. The setting applies to the running game only:
+  a value still on when the game starts is switched back off, with a log
+  line.
+- A pointer file `exports/latest-<machine>.json`, written only for the exports
+  of a headless capture: a copy of the newest sidecar under a fixed name,
+  replaced as a whole. A file held open by something else is waited for
+  briefly; a failure to replace it is logged as a warning and never fails the
+  export.
+- Sidecar: `mods` (per mod that has rows: `name`, `methods`, `methods_new`, `calls`,
+  `total_ms`, `ms_per_frame`, `calls_per_frame`, and the four `*_delta` values
+  since the previous export — the CSV's rows of that mod added up, rows flagged
+  `nested` left out), `export.dir` (the session folder) and
+  `measurement.headless`. All additive; `format` stays 2.
+- The `instrumented N methods ...` log line now ends with how long the scan
+  took.
+- A test project (`tests/ModProfiler.Tests`) for the parts that need neither
+  Unity nor the game: what keeps the profiler measuring, when a headless
+  capture starts and stops, and the pointer file.
+
+### Changed
+
+- **Pause** is disabled in both windows while a headless capture is running,
+  and the header says that one is.
+- Opening a window while the profiler is already measuring (only possible
+  during a headless capture) no longer clears the sliding window.
+
 ## [1.3.0]
 
 ### Forge version notes
 
 - A new **GC & heap panel**, in both UIs' headers and in the CSV sidecar,
   answers "is this heap growth a leak, or did the game just switch its
-  garbage collector off" - EFT turns the collector off for the whole raid
+  garbage collector off" — EFT turns the collector off for the whole raid
   on machines with 25 GB of RAM or more, and once it is off the heap
   number only ever grows. The panel shows the collector's live on/off
   state (it follows a mid-raid switch, e.g. by ArenaMode, on the very
   next sample), the managed heap size and its peak since the last Reset,
   and the allocation rate.
 - A new curated **`EFT (vanilla)`** row measures seven of the game's own
-  per-frame methods next to your mods - world tick (both of the
+  per-frame methods next to your mods — world tick (both of the
   engine's alternating per-frame call trees), bot AI, player update,
-  ballistics, the interaction prompt - answering "is this stutter my
+  ballistics, the interaction prompt — answering "is this stutter my
   mod, or the base game itself". Honestly labeled: it includes any mod
   Harmony patch attached directly to the same method, and two of the
   seven rows (`Player.ComplexUpdate`, `BallisticsCalculator.ManualUpdate`)
@@ -51,7 +99,7 @@
   by `DoWorldTick`'s own tick or the sibling `DoOtherWorldTick` call tree
   the engine also reaches it from, `ManualUpdate` by `DoWorldTick`'s
   `BallisticsTick`) and so do not add to that total. `DoOtherWorldTick`
-  exists specifically so that coverage is complete - without it, half of
+  exists specifically so that coverage is complete — without it, half of
   `ComplexUpdate`'s real cost would be silently dropped from the vanilla
   total instead of counted once. There is no per-player ballistics row:
   SPT never creates the online client's `ClientFirearmController`, and
@@ -63,7 +111,7 @@
   `EFT (vanilla)` bucket off.
 - A one-time log warning, once a raid has been measured for a minute
   (time in the menu and the hideout does not count), for any curated
-  `EFT (vanilla)` method that has recorded no calls at all - either the
+  `EFT (vanilla)` method that has recorded no calls at all — either the
   JIT inlined it before Harmony could attach the timer, or nothing in
   that raid ran it (the loot/door prompt stays idle in an Arena match,
   the bot rows in a raid without bots).
@@ -80,8 +128,8 @@
 
 ### Forge version notes
 
-- A **growth marker** (▲) now flags a mod or method whose per-frame call count -
-  its live instance count - keeps climbing for several minutes without falling
+- A **growth marker** (▲) now flags a mod or method whose per-frame call count —
+  its live instance count — keeps climbing for several minutes without falling
   back: an answer to a leak too cheap in milliseconds to show up anywhere else.
 - CSV exports can now write themselves on a timer instead of only on a button
   press (`CSV/AutoExportIntervalSeconds`), so a long raid still leaves a trail of
@@ -104,9 +152,9 @@
   after a full interval.
 - Growth marker: samples every Update/LateUpdate/FixedUpdate row's calls per
   frame (FixedUpdate: per physics step) every 20 measured seconds, and marks a
-  row when its lowest values keep rising, never falling - over about 4 minutes
+  row when its lowest values keep rising, never falling — over about 4 minutes
   if the count has at least doubled, or over about 10 minutes for a smaller
-  rise - holding the mark for about 3 minutes after the last reconfirmation and
+  rise — holding the mark for about 3 minutes after the last reconfirmation and
   clearing it at once if a sample falls back below the confirmed floor. Survives
   closing and reopening the window; cleared by Reset. Shown as a ▲ on the mod
   and method rows in both UIs (a tooltip in the web window, a line under the
@@ -163,7 +211,7 @@
 ### Added
 
 - CSV export: a `frames` column per row (how many frames it has seen since
-  it was instrumented - a row added by a later Rescan has seen fewer),
+  it was instrumented — a row added by a later Rescan has seen fewer),
   `target` for the patched original method(s) of a Harmony patch
   (`;`-separated when one patch method is attached to several), `method_token`,
   `ms_per_frame` and `calls_per_frame`, `max_ms_in_frame` (main thread only),
@@ -193,7 +241,7 @@
 ### Changed
 
 - `avg_ms_per_call` is replaced by `avg_us_per_call` (microseconds instead of
-  milliseconds) - a script reading the old column needs a one-line change to
+  milliseconds) — a script reading the old column needs a one-line change to
   the new name and unit.
 - The `method` column no longer carries the `(prefix -> target)` or
   `(coroutine/async)` suffix. A Harmony patch's target method(s) now have
@@ -203,7 +251,7 @@
 - CSV exports move from
   `BepInEx/plugins/maschine-ModProfiler/modprofiler-<time>.csv` to
   `BepInEx/plugins/maschine-ModProfiler/exports/<session>/modprofiler-<time>.csv`
-  - a script pointed at the old flat folder needs a one-line change to the
+  — a script pointed at the old flat folder needs a one-line change to the
   new per-session subfolder.
 
 ### Fixed

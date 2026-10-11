@@ -29,6 +29,7 @@ namespace ModProfiler.Profiling
         {
             bool wasActive = ProfilerCore.Active;
             ProfilerCore.Active = false;
+            long scanStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 if (_harmony == null)
@@ -62,7 +63,9 @@ namespace ModProfiler.Profiling
                 Plugin.Log.LogInfo(
                     $"instrumented {stats.Count} methods across {ProfilerCore.Mods.Count} mods " +
                     $"(+{added} new, {ProfilerCore.PatchFailures} failures" +
-                    (repaired > 0 ? $", {repaired} timers reinstated" : "") + ")");
+                    (repaired > 0 ? $", {repaired} timers reinstated" : "") + ") in " +
+                    ((System.Diagnostics.Stopwatch.GetTimestamp() - scanStarted) * ProfilerCore.MsPerTick / 1000.0)
+                        .ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + " s");
                 return added;
             }
             finally

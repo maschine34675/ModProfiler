@@ -14,7 +14,7 @@ namespace ModProfiler
     {
         public const string PluginGuid = "com.maschine.ModProfiler";
         public const string PluginName = "maschine-ModProfiler";
-        public const string PluginVersion = "1.3.0";
+        public const string PluginVersion = "1.4.0";
 
         internal static ManualLogSource Log;
 
@@ -30,6 +30,7 @@ namespace ModProfiler
         internal static ConfigEntry<bool> LogInputState;
         internal static ConfigEntry<float> SpikeThresholdMs;
         internal static ConfigEntry<float> AutoExportIntervalSeconds;
+        internal static ConfigEntry<bool> CaptureHeadless;
 
         private void Awake()
         {
@@ -67,9 +68,23 @@ namespace ModProfiler
             AutoExportIntervalSeconds = Config.Bind("CSV", "AutoExportIntervalSeconds", 0f,
                 Tagged("Auto-Export Every (s)", 10,
                     "Writes a CSV export on its own every this many seconds of measuring, into the same " +
-                    "folder as the CSV button. Time with the profiler closed or paused does not count. " +
+                    "folder as the CSV button. Time with the profiler closed or paused does not count, " +
+                    "except while a headless capture is measuring. " +
                     "0 turns it off; values below 10 count as 10.",
                     new AcceptableValueRange<float>(0f, 3600f)));
+            CaptureHeadless = Config.Bind("Capture", "Headless", false,
+                Advanced("Headless Capture", 10,
+                    "Measures without the profiler window, until this is switched off again - for automated " +
+                    "test runs that read the exports. Switching it on scans all mod code first, which can " +
+                    "freeze the game for a few seconds, and writes an export at the beginning and at the end; " +
+                    "CSV/AutoExportIntervalSeconds adds exports in between. Pause has no effect meanwhile. " +
+                    "Applies to the running game only: it is off again whenever the game starts."));
+            if (CaptureHeadless.Value)
+            {
+                CaptureHeadless.Value = false;
+                Log.LogInfo("Capture/Headless was still on from an earlier session and has been switched off - "
+                    + "it only ever applies to the running game.");
+            }
 
             ProfileHarmonyPatches = Config.Bind("Profiling", "HarmonyPatches", true,
                 Tagged("Measure Harmony Patches", 40,

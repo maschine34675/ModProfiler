@@ -23,8 +23,10 @@
   button:hover { background:#e0ca85; }
   button.quiet { background:rgba(194,173,109,0.16); color:#c2ad6d; }
   button.quiet:hover { background:rgba(194,173,109,0.3); }
+  /* The colour too: the plain button's dark text on this dark background is
+     unreadable (Pause during a headless capture); the quiet ones have it. */
   button:disabled, button:disabled:hover { opacity:.45; cursor:default;
-    background:rgba(194,173,109,0.16); }
+    background:rgba(194,173,109,0.16); color:#c2ad6d; }
   #filter { background:#101110; color:#d0cdbd; border:1px solid rgba(194,173,109,0.35);
             border-radius:4px; padding:5px 9px; font-size:12px; width:170px; }
   #filter:focus { outline:1px solid #c2ad6d; }
@@ -103,11 +105,12 @@
     <span title='Average frame time over the sliding window, and the FPS that corresponds to it.'>Frame Ø <b id='frameMs'>-</b> ms (<b id='fps'>-</b> FPS)</span>
     <span title='Sum of all mod averages. Inclusive, so it can legitimately exceed the frame time.'>profiled Σ <b id='profiled'>-</b> ms/frame</span>
     <span title='Instrumented methods across all mods. Rescan picks up patches created after the last scan.'><b id='methods'>-</b> methods</span>
-    <span title='Window: the sliding window in rendered frames that all averages and peaks refer to. Measured: every frame and second measured since the last Reset - the denominator of the totals and of the CSV export. Time with the window closed or paused does not count.'>window <b id='frames'>-</b> · measured <b id='measured'>-</b></span>
+    <span title='Window: the sliding window in rendered frames that all averages and peaks refer to. Measured: every frame and second measured since the last Reset - the denominator of the totals and of the CSV export. Time with the window closed or paused does not count, except while a headless capture is measuring.'>window <b id='frames'>-</b> · measured <b id='measured'>-</b></span>
   </div>
   <div id='memstats' class='stats'>
     <span id='gcstat' title='Whether Unity&#39;s garbage collector is enabled for this raid. EFT switches it off on machines with 25 GB or more RAM - the heap then only ever grows until the raid or the collector restarts, and every long-raid curve looks like a leak. Read live: a mod that flips it back on mid-raid (e.g. ArenaMode) shows up on the very next sample.'>GC <b id='gcmode'>-</b> <b id='gc'>-</b>/s</span>
     <span title='Managed heap size right now (GC.GetTotalMemory), its peak since the last reset, and bytes allocated per second, averaged over the last 150 frames - from GC.GetAllocatedBytesForCurrentThread where the runtime supports it; EFT&#39;s Boehm collector reports 0 for that counter, so the rate then comes from per-frame heap-size deltas (&quot;heap delta&quot; suffix): exact while the collector is off, a lower bound while it is on. With the collector off, heap only grows - watch the allocation rate for anomalies, not the slope of the heap number. Roughly 7 MB/s is normal in an Arena deathmatch.'>Heap <b id='heapmb'>-</b> MB (peak <b id='heappeak'>-</b>) · <b id='allocrate'>-</b> MB/s</span>
+    <span id='headless' class='hot' title='Capture/Headless is on: the profiler measures whether this window is open or not, and Pause cannot stop it. Switch the setting off to end the capture; it writes a final export then.'></span>
     <span id='failures' style='color:#d98a5f' title='Methods Harmony could not wrap - usually a foreign patch already uses a __state of another type. The originals are untouched, but their cost is invisible here. Click to list them; click again to return.'></span>
   </div>
   <div id='spikelog' title='Frames slower than the configured SpikeThresholdMs, with the top measured contributors of that exact frame and each one&#39;s most expensive method. GC marks a frame in which the garbage collector ran. A spike with no contributor points at the engine, at code this profiler does not measure, or at the GC.'></div>
@@ -148,6 +151,7 @@
   let failures = [];
   let lastExportShown = null;
   el('pause').onclick = () => bridge.send('cmd', snap && snap.active ? 'pause' : 'resume');
+  const PAUSE_HINT = el('pause').title;
   el('rescan').onclick = () => {
     const button = el('rescan');
     if (button.disabled) return;
@@ -246,6 +250,9 @@
     }
     el('failures').textContent = snap.failures > 0 ? snap.failures + ' patch failures' : '';
     el('pause').textContent = snap.active ? 'Pause' : 'Resume';
+    el('pause').disabled = !!snap.headless;
+    el('pause').title = snap.headless ? 'A headless capture is running (Capture/Headless) - it cannot be paused from here.' : PAUSE_HINT;
+    el('headless').textContent = snap.headless ? 'headless capture running' : '';
     drawSpark(el('framespark'), frameHistory, '#72ba80', gcMarks);
     renderSpikes();
   }

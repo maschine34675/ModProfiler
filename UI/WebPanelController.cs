@@ -123,7 +123,8 @@ namespace ModProfiler.UI
                     Plugin.Log.LogInfo("first activation - instrumenting all mod code, this can take a moment...");
                     Instrumenter.InstrumentAll();
                 }
-                ProfilerCore.ResetWindows();
+                if (!ProfilerCore.Active)
+                    ProfilerCore.ResetWindows();
             }
 
             string html = LoadPage();
@@ -210,7 +211,7 @@ namespace ModProfiler.UI
                 case "csv":
                     try
                     {
-                        return CsvExport.Begin("manual");
+                        return CsvExport.Begin(CsvExport.TriggerManual);
                     }
                     catch (Exception e)
                     {
@@ -321,6 +322,7 @@ namespace ModProfiler.UI
             json.Length = 0;
             json.Append("{\"frameMs\":").Append(ProfilerCore.AverageFrameMs().ToString("F2", CultureInfo.InvariantCulture))
                 .Append(",\"active\":").Append(ProfilerCore.Active ? "true" : "false")
+                .Append(",\"headless\":").Append(ProfilerCore.CaptureHeld ? "true" : "false")
                 .Append(",\"methods\":").Append(ProfilerCore.StatsByMethod.Count)
                 .Append(",\"frames\":").Append(frames)
                 .Append(",\"failures\":").Append(ProfilerCore.PatchFailures)

@@ -74,8 +74,21 @@ namespace ModProfiler.Profiling
         }
         internal static void SetActive(bool on)
         {
-            if (Active == on)
-                return;
+            if (Activity.SetWindow(on))
+                ApplyActivity();
+        }
+        internal const int HoldHeadless = 1;
+        internal static void SetHold(int bit, bool on)
+        {
+            if (Activity.SetHold(bit, on))
+                ApplyActivity();
+        }
+        internal static bool CaptureHeld => Activity.Held;
+
+        private static readonly ActivityArbiter Activity = new ActivityArbiter();
+        private static void ApplyActivity()
+        {
+            bool on = Activity.Active;
             Active = on;
             DropPending();
             if (on)
@@ -283,6 +296,9 @@ namespace ModProfiler.Profiling
         }
         internal static void ResetAll()
         {
+            if (CaptureHeld)
+                Plugin.Log.LogInfo("counters reset while a headless capture is running - "
+                    + "the next export starts over (reset_count goes up, its delta is since the reset)");
             ResetWindows();
             Spikes.Clear();
             for (int i = 0; i < Mods.Count; i++)
